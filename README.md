@@ -2,9 +2,9 @@
 A zero-setup Research engine  (RAG from multiple sources + local NLP in pure js),included with A local Deterministic AI synthesis using BM25, Cosine simmilarity etc. Its Experimental and not serious.
 
 ## [o] Preview
-![NEON THEME](images/Screenshot 2026-06-01 at 18-23-54 Ruminance.png)
-![DARK THEME](images/Screenshot 2026-06-01 at 18-22-59 Ruminance.png)
-![LIGHT THEME](images/Screenshot 2026-06-01 at 18-23-29 Ruminance.png)
+![NEON THEME](<images/Screenshot 2026-06-01 at 18-23-54 Ruminance.png>)
+![DARK THEME](<images/Screenshot 2026-06-01 at 18-22-59 Ruminance.png>)
+![LIGHT THEME](<images/Screenshot 2026-06-01 at 18-23-29 Ruminance.png>)
 
 ## What it does:-
 * Retrieval-Based Synthesis: It first fetches text and then answers, fetches maybe purely local or not.
