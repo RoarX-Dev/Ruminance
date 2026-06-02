@@ -1,0 +1,5361 @@
+'use strict';
+
+const SW=new Set('the a an and or but in on at to for of with by from up about into through during is are was were be been being have has had do does did will would could should may might this that these those it its he she they we you i my your his her their our not no nor so yet both either whether as if then than because while although though however therefore thus hence also just only even still already now here there what when where which who whom how all each every most more some any few much many other another such same quite very well too its off over after before between among since until whose'.split(' '));
+
+// ── THESAURUS ENGINE (Lazy loading & caching) ──────────────────────
+const ThesaurusEngine=(function(){
+  let fileHandle=null;
+  let wordIndex=new Map();
+  let lruCache=new Map();
+  let isIndexing=false;
+
+  async function loadFile(file){
+    fileHandle=file;
+    isIndexing=true;
+    let offset=0;
+    let leftover='';
+    wordIndex.clear();
+    lruCache.clear();
+    let hasSynsSet=new Set();
+
+    const stream=file.stream();
+    const reader=stream.getReader();
+    const decoder=new TextDecoder();
+
+    while(true){
+      const {done, value}=await reader.read();
+      if(done) break;
+      const text=leftover+decoder.decode(value, {stream:true});
+      let pos=0;
+      let nl=text.indexOf('\n', pos);
+      while(nl!==-1){
+        const line=text.slice(pos, nl);
+        if(line.startsWith('{"pos"')){
+          const m=line.match(/"word":\s*"([^"]+)"/);
+          if(m){
+            const w=m[1].toLowerCase();
+            const hasSyns = !line.includes('"synonyms": []');
+            if(!wordIndex.has(w)){
+              wordIndex.set(w, offset+pos);
+              if(hasSyns) hasSynsSet.add(w);
+            } else if(hasSyns && !hasSynsSet.has(w)){
+              wordIndex.set(w, offset+pos);
+              hasSynsSet.add(w);
+            }
+          }
+        }
+        pos=nl+1;
+        nl=text.indexOf('\n', pos);
+      }
+      leftover=text.slice(pos);
+      offset+=pos;
+    }
+    if(leftover){
+      const m=leftover.match(/"word":\s*"([^"]+)"/);
+      if(m){
+        const w=m[1].toLowerCase();
+        const hasSyns = !leftover.includes('"synonyms": []');
+        if(!wordIndex.has(w) || (hasSyns && !hasSynsSet.has(w))){
+          wordIndex.set(w, offset);
+        }
+      }
+    }
+    hasSynsSet.clear();
+    isIndexing=false;
+  }
+
+  async function lookupAsync(word){
+    if(!fileHandle || isIndexing) return null;
+    const w=word.toLowerCase();
+    if(lruCache.has(w)){
+      const val=lruCache.get(w);
+      lruCache.delete(w); lruCache.set(w, val);
+      return val;
+    }
+    const offset=wordIndex.get(w);
+    if(offset===undefined) return null;
+
+    const slice=fileHandle.slice(offset, offset+4096);
+    const text=await slice.text();
+    const nl=text.indexOf('\n');
+    const line=nl===-1 ? text : text.slice(0, nl);
+    try{
+      const data=JSON.parse(line);
+      if(lruCache.size>=200){
+        const firstKey=lruCache.keys().next().value;
+        lruCache.delete(firstKey);
+      }
+      lruCache.set(w, data);
+      return data;
+    }catch(e){ return null; }
+  }
+
+  function getCached(word){
+    return lruCache.get(word.toLowerCase()) || null;
+  }
+
+  async function synonymsOf(word){
+    const data=await lookupAsync(word);
+    return data ? data.synonyms : [];
+  }
+
+  function purgeCache(kg){
+    if(!kg) { lruCache.clear(); return; }
+    for(const key of lruCache.keys()){
+      if(!kg.conceptIdx[key] && !kg.topicWords[key]){
+        lruCache.delete(key);
+      }
+    }
+  }
+
+  return { loadFile, lookupAsync, getCached, synonymsOf, purgeCache, isLoaded: ()=>!!fileHandle, indexSize: ()=>wordIndex.size };
+})();
+
+async function loadThesaurus(input){
+  if(!input.files||!input.files[0])return;
+  const btnText=document.getElementById('thes-btn-text');
+  const stat=document.getElementById('h-thes');
+  btnText.textContent='📖 Loading...';
+  stat.textContent='idx...';
+  stat.style.color='var(--orange)';
+  await ThesaurusEngine.loadFile(input.files[0]);
+  btnText.textContent='📖 ✓';
+  btnText.style.color='#34d399';
+  stat.textContent=ThesaurusEngine.indexSize();
+  stat.style.color='#34d399';
+}
+
+// ══════════════════════════════════════════════════════════════════
+// GOD-TIER NLP ENGINE v2.0
+// ──────────────────────────────────────────────────────────────────
+// 1. SynonymLexicon   — 700+ synonym clusters, query expansion
+// 2. PhraseDetector   — bigram/trigram compound recognition
+// 3. SpellCorrector   — edit-distance typo repair
+// 4. QueryParser      — intent detection, entity extraction,
+//                       decomposition, rewriting
+// 5. BM25 patches     — ngram indexing + synonym-expanded scoring
+// ══════════════════════════════════════════════════════════════════
+
+// ── 1. SYNONYM LEXICON ────────────────────────────────────────────
+const SynonymLexicon=(function(){
+  // Each entry: canonical → [synonyms…]
+  // Covers: science, tech, history, medicine, geography, economics,
+  //         philosophy, arts, sports, politics, everyday language
+  const RAW={
+    // Core vocabulary
+    'begin':['start','commence','initiate','launch','originate','found','create','establish'],
+    'end':['finish','conclude','terminate','cease','stop','abolish','dissolve','complete'],
+    'make':['create','produce','manufacture','build','construct','form','generate','develop'],
+    'use':['employ','utilize','apply','implement','operate','deploy','adopt','leverage'],
+    'show':['demonstrate','reveal','indicate','display','exhibit','present','illustrate','prove'],
+    'change':['alter','modify','transform','convert','shift','transition','evolve','adapt'],
+    'increase':['grow','rise','expand','enlarge','boost','escalate','surge','climb'],
+    'decrease':['fall','drop','decline','reduce','shrink','diminish','lower','contract'],
+    'cause':['trigger','lead','result','produce','generate','induce','bring','force'],
+    'affect':['impact','influence','shape','determine','alter','modify','change'],
+    'include':['contain','comprise','consist','encompass','incorporate','subsume'],
+    'need':['require','demand','necessitate','depend','rely','must'],
+    'help':['assist','aid','support','enable','facilitate','promote','allow'],
+    'find':['discover','locate','identify','detect','uncover','reveal','determine'],
+    'know':['understand','learn','recognise','perceive','realize','grasp','comprehend'],
+    'think':['believe','consider','assume','hypothesize','theorize','conclude','reason'],
+    'say':['state','claim','argue','assert','declare','maintain','contend','suggest'],
+    'get':['obtain','acquire','gain','receive','achieve','attain','secure'],
+    'give':['provide','offer','supply','deliver','grant','award','yield'],
+    'take':['adopt','accept','receive','capture','seize','acquire','obtain'],
+    'move':['travel','migrate','transfer','shift','transport','relocate','spread'],
+    'grow':['develop','expand','increase','evolve','mature','advance','progress'],
+    'work':['function','operate','perform','act','labor','effort','mechanism'],
+    'live':['reside','exist','inhabit','dwell','survive','occupy'],
+    'die':['perish','expire','cease','end','fall','collapse','fail'],
+    'fight':['battle','combat','struggle','conflict','oppose','resist','contest'],
+    'control':['govern','rule','manage','administer','direct','oversee','command','regulate'],
+    'large':['big','great','vast','huge','massive','enormous','extensive','substantial'],
+    'small':['tiny','little','minor','limited','narrow','slight','minimal','brief'],
+    'important':['significant','major','critical','key','essential','vital','central','primary'],
+    'old':['ancient','historic','traditional','original','early','former','prior'],
+    'new':['modern','recent','contemporary','current','novel','innovative','emerging'],
+    'different':['distinct','diverse','varied','separate','alternative','various','unlike'],
+    'similar':['alike','comparable','equivalent','related','corresponding','matching'],
+    'good':['effective','successful','positive','beneficial','useful','valuable','quality'],
+    'bad':['poor','negative','harmful','ineffective','problematic','adverse'],
+    // Science & Technology
+    'computer':['machine','device','processor','system','calculator','PC'],
+    'software':['program','application','code','system','platform','tool','app'],
+    'internet':['web','network','online','digital','cyber','connected'],
+    'data':['information','facts','statistics','records','evidence','knowledge'],
+    'energy':['power','force','capacity','fuel','electricity','heat','radiation'],
+    'cell':['unit','organism','biology','membrane','nucleus','tissue'],
+    'gene':['DNA','genome','heredity','genetics','chromosome','allele','trait'],
+    'evolution':['development','change','adaptation','natural selection','Darwin','species'],
+    'atom':['molecule','particle','element','nucleus','electron','quantum'],
+    'force':['power','energy','pressure','gravity','momentum','stress','load'],
+    'temperature':['heat','cold','thermal','degree','celsius','fahrenheit','kelvin'],
+    'light':['radiation','photon','optics','electromagnetic','visible','wave'],
+    'disease':['illness','condition','disorder','syndrome','infection','sickness','pathology'],
+    'medicine':['drug','treatment','therapy','pharmaceutical','cure','remedy','medication'],
+    'surgery':['operation','procedure','medical','intervention','transplant','resection'],
+    'brain':['mind','neural','cognitive','neurological','cerebral','mental','intellect'],
+    'psychology':['mental','behavior','cognitive','emotional','psychiatric','mind'],
+    'climate':['weather','temperature','atmosphere','environment','ecological','meteorological'],
+    'pollution':['contamination','toxin','emissions','environmental','waste','degradation'],
+    'agriculture':['farming','cultivation','crop','harvest','livestock','rural','food production'],
+    'technology':['tech','innovation','engineering','machinery','automation','digital'],
+    'artificial intelligence':['AI','machine learning','deep learning','neural network','ML','algorithm'],
+    'machine learning':['AI','deep learning','neural network','model','training','classification'],
+    'algorithm':['method','procedure','process','computation','formula','rule','logic'],
+    'database':['storage','repository','data store','SQL','records','index'],
+    'network':['system','infrastructure','grid','connection','topology','web'],
+    // History & Politics
+    'war':['conflict','battle','combat','military','armed','hostilities','campaign'],
+    'revolution':['uprising','rebellion','overthrow','coup','revolt','transformation'],
+    'empire':['kingdom','dynasty','realm','colonial','dominion','power','state'],
+    'government':['state','administration','authority','regime','rule','political','system'],
+    'democracy':['republic','electoral','voting','parliamentary','constitutional','freedom'],
+    'economy':['economic','financial','trade','market','GDP','commerce','fiscal'],
+    'trade':['commerce','exchange','import','export','market','business','economic'],
+    'colonialism':['imperialism','colonial','empire','occupation','conquest','subjugation'],
+    'independence':['sovereignty','freedom','liberation','autonomy','self-rule','separation'],
+    'law':['legislation','statute','regulation','policy','rule','legal','judicial'],
+    'treaty':['agreement','pact','accord','convention','alliance','deal','settlement'],
+    'election':['vote','ballot','democratic','poll','campaign','political'],
+    'capitalism':['market economy','free market','private enterprise','profit','investment'],
+    'socialism':['collective','state ownership','public','welfare','redistribution'],
+    'nationalism':['patriotism','sovereignty','identity','statehood','ethnic','cultural'],
+    'religion':['faith','belief','spiritual','doctrine','worship','theology','church'],
+    'philosophy':['thought','ethics','metaphysics','logic','reasoning','worldview'],
+    // Geography & Places
+    'country':['nation','state','land','territory','region','republic','kingdom'],
+    'city':['town','urban','metropolitan','capital','municipality','settlement'],
+    'river':['stream','waterway','tributary','canal','flow','current'],
+    'mountain':['hill','peak','range','elevation','highland','summit','ridge'],
+    'ocean':['sea','marine','aquatic','water','coastal','maritime'],
+    'forest':['woodland','jungle','trees','ecosystem','vegetation','rainforest'],
+    'desert':['arid','dry','barren','sand','sahara','wasteland'],
+    // Economics & Business
+    'money':['currency','finance','capital','funds','cash','wealth','asset'],
+    'price':['cost','value','rate','fee','charge','expense','tariff'],
+    'company':['corporation','firm','business','enterprise','organization','industry'],
+    'investment':['capital','funding','finance','venture','asset','portfolio'],
+    'inflation':['price rise','cost increase','monetary','economic','devaluation'],
+    'production':['manufacturing','output','yield','supply','creation','making'],
+    'consumption':['demand','usage','spending','purchasing','intake'],
+    // Arts & Culture
+    'art':['painting','sculpture','creative','visual','aesthetic','artistic','design'],
+    'music':['sound','audio','melody','rhythm','song','composition','acoustic'],
+    'literature':['writing','text','book','narrative','fiction','prose','poetry'],
+    'film':['movie','cinema','video','documentary','production','screenplay'],
+    'architecture':['building','structure','design','construction','urban'],
+    // Medicine & Biology
+    'heart':['cardiac','cardiovascular','circulation','blood','coronary'],
+    'blood':['vascular','hematology','plasma','circulation','hemoglobin'],
+    'cancer':['tumor','malignant','oncology','carcinoma','metastasis','neoplasm'],
+    'infection':['bacterial','viral','pathogen','microbial','contagion','epidemic'],
+    'vaccine':['immunization','inoculation','immunity','prophylaxis','antibody'],
+    'hospital':['clinic','medical center','healthcare','ward','treatment facility'],
+    // Physics & Chemistry
+    'gravity':['gravitational','mass','weight','attraction','spacetime','Newton'],
+    'electricity':['electric','current','voltage','circuit','power','charge'],
+    'chemical':['compound','substance','element','molecular','reaction','synthesis'],
+    'quantum':['particle','wave','uncertainty','photon','electron','subatomic'],
+    'nuclear':['atomic','fission','fusion','radiation','radioactive','reactor'],
+    // Additional common expansions
+    'explain':['describe','define','clarify','elaborate','outline','overview'],
+    'compare':['contrast','difference','versus','vs','distinction','similarity'],
+    'history':['historical','past','origin','background','evolution','timeline'],
+    'cause':['reason','why','because','factor','source','root'],
+    'effect':['result','consequence','impact','outcome','implication','influence'],
+    'example':['instance','case','illustration','sample','demonstration'],
+    'type':['kind','category','form','variety','class','species','genre'],
+    'part':['component','element','section','piece','aspect','feature','module'],
+    'process':['procedure','method','approach','mechanism','system','operation'],
+    'problem':['issue','challenge','difficulty','obstacle','limitation','concern'],
+    'solution':['answer','resolution','fix','remedy','approach','strategy'],
+    'research':['study','investigation','analysis','exploration','experiment','survey'],
+    'theory':['hypothesis','model','framework','concept','idea','paradigm'],
+    'evidence':['proof','data','fact','observation','record','documentation'],
+  };
+
+  // Build reverse map: synonym → canonical
+  const expand=new Map(); // word → Set of related stems
+  for(const[canon,syns] of Object.entries(RAW)){
+    const canonStem=canon.toLowerCase();
+    if(!expand.has(canonStem))expand.set(canonStem,new Set());
+    expand.get(canonStem).add(canonStem);
+    for(const s of syns){
+      const sl=s.toLowerCase();
+      expand.get(canonStem).add(sl);
+      // Reverse: synonym → canonical's cluster
+      if(!expand.has(sl))expand.set(sl,new Set());
+      expand.get(sl).add(canonStem);
+      expand.get(sl).add(sl);
+      // Cross-links among synonyms
+      for(const s2 of syns){expand.get(sl).add(s2.toLowerCase());}
+    }
+  }
+
+  // Expand a single stemmed word → Set of all related words
+  function expandWord(w){
+    const result=new Set([w]);
+    if(expand.has(w))for(const r of expand.get(w))result.add(r);
+    // Also try stem
+    const stem=NLPStemmer.stemWord(w);
+    if(stem&&stem!==w&&expand.has(stem))for(const r of expand.get(stem))result.add(r);
+    return result;
+  }
+
+  // Expand a token array — returns augmented token array with synonym variants
+  function expandTokens(tokens){
+    const out=[];
+    const seen=new Set(tokens);
+    for(const t of tokens){
+      out.push(t);
+      for(const variant of expandWord(t)){
+        if(!seen.has(variant)&&variant.length>2){seen.add(variant);out.push(variant);}
+      }
+    }
+    return out;
+  }
+
+  return{expandWord,expandTokens,RAW};
+})();
+
+// ── 2. PHRASE DETECTOR ────────────────────────────────────────────
+// Recognises common multi-word phrases so they're treated as single
+// tokens in BM25 and CosineSynth, boosting precision.
+const PhraseDetector=(function(){
+  // High-frequency multi-word phrases across many domains.
+  // Phrases are normalised (lowercase, inner spaces → underscore for
+  // the unified token key) and also keyed as individual words for
+  // overlap detection.
+  const PHRASE_LIST=[
+    // Science & Tech
+    'artificial intelligence','machine learning','deep learning','neural network',
+    'natural language processing','computer vision','data science','big data',
+    'quantum computing','cloud computing','internet of things','blockchain technology',
+    'climate change','global warming','greenhouse gas','renewable energy',
+    'solar energy','nuclear power','electric vehicle','carbon dioxide',
+    'natural selection','evolutionary theory','genetic engineering','stem cell',
+    'human genome','protein synthesis','immune system','nervous system',
+    'solar system','black hole','dark matter','dark energy','gravitational wave',
+    'periodic table','chemical reaction','nuclear fission','nuclear fusion',
+    // History & Politics
+    'world war','cold war','civil war','french revolution','industrial revolution',
+    'american revolution','russian revolution','british empire','roman empire',
+    'ottoman empire','mongol empire','east india company','silk road',
+    'united nations','european union','world trade organization',
+    'great depression','stock market','human rights','civil rights',
+    'second world war','first world war','middle ages','ancient rome','ancient egypt',
+    'ancient greece','feudal system','magna carta','french revolution',
+    // Geography
+    'united states','united kingdom','south africa','latin america','middle east',
+    'south asia','southeast asia','central america','north america',
+    'pacific ocean','atlantic ocean','indian ocean','amazon river',
+    'nile river','great wall','taj mahal',
+    // Economics
+    'gross domestic product','supply chain','free trade','market economy',
+    'interest rate','exchange rate','trade deficit','trade surplus',
+    'central bank','stock exchange','venture capital','private equity',
+    'inflation rate','unemployment rate',
+    // Medicine
+    'heart disease','mental health','blood pressure','immune response',
+    'clinical trial','public health','infectious disease','chronic disease',
+    'blood sugar','nervous system','respiratory system','digestive system',
+    // Social
+    'social media','mass media','civil society','human behavior',
+    'social class','economic inequality','cultural diversity','gender equality',
+    'political party','electoral system','judicial review','supreme court',
+    // Philosophy & Religion
+    'free will','moral philosophy','social contract','political philosophy',
+    'western philosophy','eastern philosophy','scientific method',
+  ];
+
+  // Build a quick lookup: first word → list of phrases starting with it
+  const byFirst=new Map();
+  for(const ph of PHRASE_LIST){
+    const words=ph.split(' ');
+    if(!byFirst.has(words[0]))byFirst.set(words[0],[]);
+    byFirst.get(words[0]).push(words);
+  }
+
+  // Convert phrase to unified token key
+  const phraseKey=ph=>ph.replace(/\s+/g,'_');
+
+  // Tokenise text AND detect phrases within it, returning a mixed
+  // array of single-word stems + phrase keys (e.g. "machine_learning")
+  function tokenizeWithPhrases(text){
+    const words=text.toLowerCase().replace(/[^a-z\s]/g,' ').split(/\s+/).filter(Boolean);
+    const out=[];
+    let i=0;
+    while(i<words.length){
+      const w=words[i];
+      let matched=false;
+      const candidates=byFirst.get(w)||[];
+      // Try longest phrase first (greedy)
+      candidates.sort((a,b)=>b.length-a.length);
+      for(const phrase of candidates){
+        if(i+phrase.length<=words.length){
+          const slice=words.slice(i,i+phrase.length);
+          if(slice.every((sw,k)=>sw===phrase[k])){
+            const key=phraseKey(phrase.join(' '));
+            out.push(key);
+            // Also push individual stems for recall
+            for(const pw of phrase){
+              const st=NLPStemmer.stemWord(pw);
+              if(st&&st.length>2&&!SW.has(pw))out.push(st);
+            }
+            i+=phrase.length;
+            matched=true;
+            break;
+          }
+        }
+      }
+      if(!matched){
+        if(!SW.has(w)&&w.length>2)out.push(NLPStemmer.stemWord(w)||w);
+        i++;
+      }
+    }
+    return out;
+  }
+
+  return{tokenizeWithPhrases,phraseKey,PHRASE_LIST};
+})();
+
+// ── 3. SPELL CORRECTOR ────────────────────────────────────────────
+// Edit-distance-1 correction against a dynamic vocabulary built from
+// the BM25 corpus. Ultra-fast: generates candidates, checks against
+// known vocab. Only fires on short queries (< 5 tokens) where a typo
+// is more likely to tank retrieval.
+const SpellCorrector=(function(){
+  const vocab=new Map(); // word → frequency
+  const ALPHA='abcdefghijklmnopqrstuvwxyz';
+
+  function feed(text){
+    text.toLowerCase().replace(/[^a-z\s]/g,' ').split(/\s+/)
+    .filter(w=>w.length>3&&!SW.has(w))
+    .forEach(w=>vocab.set(w,(vocab.get(w)||0)+1));
+  }
+
+  function edits1(word){
+    const results=new Set();
+    // Deletions
+    for(let i=0;i<word.length;i++)results.add(word.slice(0,i)+word.slice(i+1));
+    // Transpositions
+    for(let i=0;i<word.length-1;i++)results.add(word.slice(0,i)+word[i+1]+word[i]+word.slice(i+2));
+    // Substitutions
+    for(let i=0;i<word.length;i++)for(const c of ALPHA)results.add(word.slice(0,i)+c+word.slice(i+1));
+    // Insertions
+    for(let i=0;i<=word.length;i++)for(const c of ALPHA)results.add(word.slice(0,i)+c+word.slice(i));
+    return results;
+  }
+
+  function correct(word){
+    if(word.length<4)return word; // don't correct short words
+    if(vocab.has(word))return word; // already known
+    // Candidates = known words at edit distance 1
+    const candidates=[...edits1(word)].filter(w=>vocab.has(w));
+    if(!candidates.length)return word; // no correction found
+    // Pick highest-frequency candidate
+    return candidates.reduce((best,w)=>(vocab.get(w)>vocab.get(best)?w:best),candidates[0]);
+  }
+
+  // Correct all tokens in a query, return corrected string
+  function correctQuery(q){
+    const tokens=q.toLowerCase().replace(/[^a-z\s]/g,' ').split(/\s+/).filter(Boolean);
+    if(tokens.length>6)return q; // only correct short queries
+    const corrected=tokens.map(t=>correct(t));
+    const changed=corrected.some((t,i)=>t!==tokens[i]);
+    return changed?corrected.join(' '):q;
+  }
+
+  return{feed,correct,correctQuery,vocab};
+})();
+
+// ── 4. QUERY PARSER ───────────────────────────────────────────────
+// God-tier query understanding: intent detection, entity extraction,
+// query decomposition, normalization, search-string optimization.
+const QueryParser=(function(){
+
+  // Intent patterns — ordered most-specific first
+  const INTENTS=[
+    // Comparison
+    {id:'compare',
+      pattern:/\b(compare|versus|vs\.?|difference between|similarities?|contrast|which is better|pros and cons)\b/i,
+                   extract:q=>{
+                     const m=q.match(/(?:compare|between|versus|vs\.?)\s+(.+?)\s+(?:and|vs\.?|versus|or)\s+(.+?)(?:\?|$)/i);
+                     return m?{entities:[m[1].trim(),m[2].trim()]}:{entities:[]};
+                   }},
+                   // Definition
+                   {id:'define',
+                     pattern:/^(what (is|are|was|were)|define|meaning of|definition of|explain what|what does .+ mean)/i,
+                   extract:q=>{
+                     const m=q.match(/(?:what (?:is|are|was|were)|define|meaning of|definition of|explain what)\s+(?:a|an|the\s+)?(.+?)(?:\?|$)/i);
+                     return m?{entities:[m[1].trim()]}:{entities:[]};
+                   }},
+                   // How-it-works
+                   {id:'mechanism',
+                     pattern:/\b(how does|how do|how is|how are|how can|mechanism|process of|how .+ works?)\b/i,
+                   extract:q=>{
+                     const m=q.match(/(?:how (?:does|do|is|are|can)\s+)?(.+?)\s+(?:work|function|operate|process)/i)
+                     ||q.match(/(?:process|mechanism)\s+(?:of|for)\s+(.+?)(?:\?|$)/i);
+                     return m?{entities:[m[1].trim()]}:{entities:[]};
+                   }},
+                   // History / Origin
+                   {id:'history',
+                     pattern:/\b(history of|origin of|when was|when did|founded|established|invented|discovered|timeline|background of)\b/i,
+                   extract:q=>{
+                     const m=q.match(/(?:history|origin|background)\s+(?:of|behind)\s+(.+?)(?:\?|$)/i)
+                     ||q.match(/(?:when (?:was|did))\s+(.+?)(?:\s+(?:founded|established|invented|discovered|created))?(?:\?|$)/i);
+                     return m?{entities:[m[1].trim()]}:{entities:[]};
+                   }},
+                   // Cause / Effect
+                   {id:'causal',
+                     pattern:/\b(why did|why does|why is|cause of|causes|reason for|what caused|effects? of|impact of|consequence)\b/i,
+                   extract:q=>{
+                     const m=q.match(/(?:why (?:did|does|is)|cause of|causes of|reason for|effects? of|impact of)\s+(.+?)(?:\?|$)/i);
+                     return m?{entities:[m[1].trim()]}:{entities:[]};
+                   }},
+                   // List / enumeration
+                   {id:'list',
+                     pattern:/\b(list|examples? of|types? of|kinds? of|forms? of|categories|what are|name|enumerate|give me)\b/i,
+                   extract:q=>{
+                     const m=q.match(/(?:list|examples? of|types? of|kinds? of|forms? of|what are)\s+(?:the\s+)?(.+?)(?:\?|$)/i);
+                     return m?{entities:[m[1].trim()]}:{entities:[]};
+                   }},
+                   // People
+                   {id:'person',
+                     pattern:/\b(who is|who was|who are|who were|biography|about [A-Z][a-z]+)\b/,
+                   extract:q=>{
+                     const m=q.match(/(?:who (?:is|was|are|were))\s+(.+?)(?:\?|$)/i)
+                     ||q.match(/(?:biography|about)\s+([A-Z][a-z]+(?: [A-Z][a-z]+)*)/);
+                     return m?{entities:[m[1].trim()]}:{entities:[]};
+                   }},
+                   // Location
+                   {id:'location',
+                     pattern:/\b(where is|where are|where was|location of|capital of|country of|geography)\b/i,
+                   extract:q=>{
+                     const m=q.match(/(?:where (?:is|are|was)|location of|capital of)\s+(.+?)(?:\?|$)/i);
+                     return m?{entities:[m[1].trim()]}:{entities:[]};
+                   }},
+                   // Quantitative
+                   {id:'quantitative',
+                     pattern:/\b(how many|how much|how long|how far|how tall|how big|what percentage|statistics|number of|size of|population)\b/i,
+                   extract:q=>{return{entities:[]};}},
+                   // Default: informational
+                   {id:'info',
+                     pattern:/.*/,
+                     extract:q=>{return{entities:[]};}},
+  ];
+
+  // Named entity patterns (fast regex-based)
+  const NE_PATTERNS=[
+    {type:'PERSON',    pat:/\b([A-Z][a-z]+(?: [A-Z][a-z]+){1,3})\b/g},
+                   {type:'YEAR',      pat:/\b(1[0-9]{3}|20[0-2][0-9])\b/g},
+                   {type:'COUNTRY',   pat:/\b(Afghanistan|Africa|Albania|Algeria|America|Argentina|Australia|Austria|Bangladesh|Belgium|Bolivia|Brazil|Britain|Canada|Chile|China|Colombia|Cuba|Egypt|Ethiopia|France|Germany|Ghana|Greece|Hungary|India|Indonesia|Iran|Iraq|Ireland|Israel|Italy|Japan|Kenya|Korea|Libya|Malaysia|Mexico|Morocco|Netherlands|Nigeria|Norway|Pakistan|Peru|Philippines|Poland|Portugal|Russia|Saudi Arabia|South Africa|Spain|Sudan|Sweden|Switzerland|Syria|Taiwan|Thailand|Turkey|Uganda|Ukraine|United Kingdom|United States|Venezuela|Vietnam|Zimbabwe)\b/g},
+                   {type:'ORG',       pat:/\b(UN|NATO|WHO|IMF|EU|OPEC|FBI|CIA|NASA|Google|Apple|Microsoft|Amazon|Facebook|Tesla|SpaceX|Wikipedia)\b/g},
+  ];
+
+  // Multi-query decomposition: split compound questions
+  function decompose(q){
+    // "X and Y" where both halves look like questions
+    const andSplit=q.match(/^(.{10,}?)\s+and\s+((?:what|how|why|when|where|who).{5,})$/i);
+    if(andSplit)return[andSplit[1].trim(),andSplit[2].trim()];
+    // Semicolon or comma-separated questions
+    const parts=q.split(/[;,]\s+/).filter(p=>p.trim().length>8);
+    if(parts.length>1&&parts.every(p=>/\b(what|how|why|when|where|who|explain|describe|compare|define)\b/i.test(p)))
+      return parts.map(p=>p.trim());
+    return[q];
+  }
+
+  // Normalise query: strip filler, fix casing
+  const FILLER=/^(tell me (?:about|regarding|concerning)|explain(?: to me)?|i want to know(?: about)?|i'm curious about|give me information(?: on)?|what can you tell me about|search for|look up|find me information on)\s+/i;
+  function normalize(q){
+    return q.replace(FILLER,'').replace(/\?+$/,'').trim();
+  }
+
+  // Extract named entities from query
+  function extractEntities(q){
+    const found=[];
+    for(const{type,pat} of NE_PATTERNS){
+      let m;pat.lastIndex=0;
+      while((m=pat.exec(q))!==null)found.push({type,text:m[1]});
+    }
+    return found;
+  }
+
+  // Detect intent
+  function detectIntent(q){
+    for(const intent of INTENTS){
+      if(intent.pattern.test(q)){
+        const extra=intent.extract(q);
+        return{id:intent.id,...extra};
+      }
+    }
+    return{id:'info',entities:[]};
+  }
+
+  // Build the best external search string from a query
+  // - Strips filler words, extracts noun phrases
+  // - For compare intent: "X vs Y"
+  // - For definition: "X definition"
+  // - For history: "X history"
+  function toSearchString(q,intent){
+    const norm=normalize(q);
+    if(intent.id==='compare'&&intent.entities&&intent.entities.length>=2){
+      return`${intent.entities[0]} vs ${intent.entities[1]}`;
+    }
+    if(intent.id==='define'&&intent.entities&&intent.entities.length){
+      return`${intent.entities[0]}`;
+    }
+    if(intent.id==='history'&&intent.entities&&intent.entities.length){
+      return`${intent.entities[0]} history`;
+    }
+    if(intent.id==='mechanism'&&intent.entities&&intent.entities.length){
+      return`how ${intent.entities[0]} works`;
+    }
+    if(intent.id==='causal'&&intent.entities&&intent.entities.length){
+      return`causes effects ${intent.entities[0]}`;
+    }
+    if(intent.id==='person'&&intent.entities&&intent.entities.length){
+      return`${intent.entities[0]}`;
+    }
+    // Generic: strip stopwords, keep content words + any NEs
+    const ne=extractEntities(norm).map(e=>e.text);
+    const contentWords=norm.toLowerCase()
+    .replace(/[^a-z\s]/g,' ').split(/\s+/)
+    .filter(w=>w.length>2&&!SW.has(w));
+    const combined=[...new Set([...ne.map(e=>e.toLowerCase()),...contentWords])].slice(0,7);
+    return combined.join(' ')||norm;
+  }
+
+  // Full parse: returns intent, entities, normalized query, search string,
+  // expanded BM25 tokens, and sub-queries (if compound)
+  function parse(rawQuery){
+    const norm=normalize(rawQuery);
+    const corrected=SpellCorrector.correctQuery(norm);
+    const subQueries=decompose(corrected);
+    const intent=detectIntent(corrected);
+    const entities=extractEntities(corrected);
+    const searchStr=toSearchString(corrected,intent);
+
+    // Build expanded BM25 token set (original stems + synonym expansions + phrase tokens)
+    const baseTokens=PhraseDetector.tokenizeWithPhrases(corrected);
+    const expandedTokens=SynonymLexicon.expandTokens(baseTokens);
+
+    return{
+      raw:rawQuery,
+      normalized:norm,
+      corrected,
+      subQueries,
+      intent,
+      entities,
+      searchStr,
+      baseTokens,
+      expandedTokens,
+    };
+  }
+
+  return{parse,normalize,detectIntent,extractEntities,decompose,toSearchString};
+})();
+
+// NOTE: nlpTok upgrade + BM25.prototype patches are applied AFTER the class definitions below.
+
+// ══════════════════════════════════════════════════════════════════
+// MULTI-PASS NLP STEMMER
+// Pipeline: each rule checks applicability first, then transforms.
+// Rules are ordered: specific → general. Each pass is guarded by
+// a minimum-length check and an exception list where needed.
+// Returns the best stem found (the shortest non-broken root).
+// ══════════════════════════════════════════════════════════════════
+const NLPStemmer=(function(){
+  // Words that must never be stemmed — their surface form IS the root
+  // or stemming them produces a nonsense string.
+  const PROTECT=new Set([
+    // Short words that match suffix patterns but shouldn't change
+    'ring','sing','king','wing','sting','swing','bring','spring','thing','string',
+    'being','doing','going','seeing','saying','having',
+    'red','bed','led','fed','wed','shed',
+    'needed','seeded','added','nodded',
+    'older','bolder','folder','shoulder','boulder',
+    'butter','letter','bitter','better','litter','matter','otter',
+    'enter','center','center','winter','hunter','wonder','under','inter',
+    'rely','apply','supply','reply','imply','comply','deploy',
+    'city','pity','duty','jury','body','copy','baby',
+    'ably','only','holy','ugly',
+    'uses','axes','buses','gases','cases','bases','faces','races','laces',
+    'goes','does','toes','foes','woes',
+    'ages','ages','pages','wages','cages','sages','rages',
+    'ices','aces','dices','laces',
+    // Known -ness words where removing suffix gives a bad root
+    'fitness','witness','illness','madness','sadness','kindness','boldness',
+    // -ment where stem is already good
+    'cement','comment','content','moment','torment',
+    // -ly where root is odd if stripped
+    'only','early','ugly','oily','burly','surly','gnarly','nearly','really',
+    'truly','duly','newly','fully',
+    // -er that is a root, not comparative/agent
+    'laser','tiger','lager','layer','paper','power','tower','lower','outer','inner',
+    'order','under','enter','inter','after','water','later','voter','meter','liter',
+    // -ed roots
+    'embed','proceed','exceed','succeed','agreed',
+    // -al roots
+    'animal','signal','canal','metal','regal','legal','medal','pedal','modal',
+    // Gerunds / verbal nouns that ARE nouns
+    'building','ceiling','clothing','coating','crossing','dealing','drawing',
+    'dwelling','earning','feeling','filing','flooring','funding','gathering',
+    'greeting','heading','heating','helping','housing','hunting','keeping',
+    'landing','leading','learning','lighting','lining','listing','living',
+    'loading','lodging','meaning','meeting','morning','nursing','offering',
+    'opening','painting','parking','pricing','printing','reading','ruling',
+    'saving','savings','seating','setting','shipping','shopping','sitting',
+    'skiing','smoking','spending','staffing','teaching','training','warning',
+    'wedding','writing'
+  ]);
+
+  // Consonant doubling map — used to detect doubled finals before -ed/-ing
+  // e.g. "running" → stem check: "runn" → doubled n → "run"
+  const DOUBLES=/([bcdfghjklmnpqrstvwxyz])\1$/;
+
+  // Multi-pass stemming pipeline.
+  // Each rule is: { test(w), apply(w) }
+  // Rules are tried in order; the first applicable rule wins for that pass.
+  // We run up to 3 passes on the word, stopping when no rule fires.
+  const RULES=[
+
+    // ── PASS A: Derivational suffixes (longest first) ─────────────────
+
+    // -ational → -ate  (informational → inform, educational → educat)
+    {id:'ational', test:w=>w.length>9&&/ational$/.test(w),
+      apply:w=>w.replace(/ational$/,'ate')},
+
+                  // -tional → -tion  (national stays, optional → option-like; mostly skip)
+                  // Actually: -tional→ drop to base: "functional" → "function"
+                  {id:'tional', test:w=>w.length>8&&/tional$/.test(w),
+                    apply:w=>w.replace(/tional$/,'tion')},
+
+                  // -isation / -ization → -ise/-ize stem
+                  {id:'ization', test:w=>w.length>9&&/ization$/.test(w),
+                    apply:w=>w.replace(/ization$/,'ize')},
+                  {id:'isation', test:w=>w.length>9&&/isation$/.test(w),
+                    apply:w=>w.replace(/isation$/,'ise')},
+
+                  // -fulness → -ful (hopefulness → hopeful)
+                  {id:'fulness', test:w=>w.length>9&&/fulness$/.test(w),
+                    apply:w=>w.replace(/fulness$/,'ful')},
+
+                  // -ousness → strip (dangerousness → danger)
+                  {id:'ousness', test:w=>w.length>9&&/ousness$/.test(w),
+                    apply:w=>w.replace(/ousness$/,'')},
+
+                  // -iveness → -ive (effectiveness → effective)
+                  {id:'iveness', test:w=>w.length>9&&/iveness$/.test(w),
+                    apply:w=>w.replace(/iveness$/,'ive')},
+
+                  // -nesses → -ness → (handled in next pass after -ness rule)
+                  {id:'nesses', test:w=>w.length>8&&/nesses$/.test(w),
+                    apply:w=>w.replace(/nesses$/,'')},
+
+                  // -ments → -ment  (adjustments → adjustment)
+                  {id:'ments', test:w=>w.length>7&&/ments$/.test(w),
+                    apply:w=>w.replace(/ments$/,'ment')},
+
+                  // -ations → -ate  (organisations → organise)
+                  {id:'ations', test:w=>w.length>8&&/ations$/.test(w),
+                    apply:w=>w.replace(/ations$/,'ate')},
+
+                  // -tion/-sion → strip (also normalises -tion→root in next pass)
+                  {id:'tion', test:w=>w.length>6&&/[ts]ion$/.test(w),
+                    apply:w=>w.replace(/[ts]ion$/,'')},
+
+                  // -ness → strip (sadness→sad, kindness→kind)
+                  // Protected: fitness, witness (in PROTECT list)
+                  {id:'ness', test:w=>w.length>6&&/ness$/.test(w),
+                    apply:w=>w.replace(/ness$/,'')},
+
+                  // -ment → strip (development→develop, argument→argu→skip short)
+                  {id:'ment', test:w=>w.length>6&&/ment$/.test(w),
+                    apply:w=>{ const s=w.replace(/ment$/,''); return s.length>=4?s:w; }},
+
+                  // -ity/-ety → remove (activity→activ, clarity→clar)
+                  {id:'ity', test:w=>w.length>6&&/[ie]ty$/.test(w),
+                    apply:w=>w.replace(/[ie]ty$/,'')},
+
+                  // -ism → remove (capitalism→capital, mechanism→mechanic)
+                  {id:'ism', test:w=>w.length>5&&/ism$/.test(w),
+                    apply:w=>w.replace(/ism$/,'')},
+
+                  // -ist → remove (scientist→scienc, capitalist→capital)
+                  {id:'ist', test:w=>w.length>5&&/ist$/.test(w),
+                    apply:w=>w.replace(/ist$/,'')},
+
+                  // -ful → remove (helpful→help, powerful→power)
+                  {id:'ful', test:w=>w.length>5&&/ful$/.test(w),
+                    apply:w=>w.replace(/ful$/,'')},
+
+                  // -less → remove (hopeless→hope, careless→care)
+                  {id:'less', test:w=>w.length>6&&/less$/.test(w),
+                    apply:w=>w.replace(/less$/,'')},
+
+                  // -ous → remove (famous→fam, dangerous→danger)
+                  {id:'ous', test:w=>w.length>5&&/ous$/.test(w),
+                    apply:w=>w.replace(/ous$/,'')},
+
+                  // -ive → remove (active→act, massive→mass)
+                  {id:'ive', test:w=>w.length>5&&/ive$/.test(w),
+                    apply:w=>w.replace(/ive$/,'')},
+
+                  // -al → remove (national→nation, logical→logic) but not -ical short words
+                  {id:'ical', test:w=>w.length>7&&/ical$/.test(w),
+                    apply:w=>w.replace(/ical$/,'ic')},
+                  {id:'al', test:w=>w.length>6&&/al$/.test(w)&&!/[aeiou]al$/.test(w),
+                    apply:w=>w.replace(/al$/,'')},
+
+                  // -ance/-ence → remove (performance→perform, science→scien)
+                  {id:'ance', test:w=>w.length>7&&/[ae]nce$/.test(w),
+                    apply:w=>w.replace(/[ae]nce$/,'')},
+
+                  // -ancy/-ency → -ant/-ent (efficiency→efficient-ish)
+                  {id:'ancy', test:w=>w.length>7&&/[ae]ncy$/.test(w),
+                    apply:w=>w.replace(/[ae]ncy$/,'')},
+
+                  // ── PASS B: Inflectional suffixes ─────────────────────────────────
+
+                  // -ying → -y  (studying→study, applying→apply) — must check 3+ chars before y
+                  {id:'ying', test:w=>w.length>5&&/ying$/.test(w),
+                    apply:w=>w.replace(/ying$/,'y')},
+
+                  // -ied → -y  (studied→study, applied→apply)
+                  {id:'ied', test:w=>w.length>4&&/ied$/.test(w),
+                    apply:w=>w.replace(/ied$/,'y')},
+
+                  // -ies → -y  (studies→study, carries→carry)
+                  {id:'ies', test:w=>w.length>4&&/ies$/.test(w),
+                    apply:w=>w.replace(/ies$/,'y')},
+
+                  // -ing with consonant-doubling reversal  (running→run, sitting→sit)
+                  // Pattern: consonant doubled right before -ing  → remove double + ing
+                  {id:'ingdbl', test:w=>w.length>5&&/ing$/.test(w)&&DOUBLES.test(w.slice(0,-3)),
+                    apply:w=>w.replace(/(.)\1ing$/,'$1')},
+
+                  // -ing with e-restoration  (taking→take, making→make, loving→love)
+                  // Pattern: word ends in consonant+ing, and the consonant is NOT {w,x,y}
+                  // heuristic: if stem+e exists plausibly (length >= 3), restore
+                  {id:'inge', test:w=>w.length>5&&/[^aeiouwxy]ing$/.test(w),
+                    apply:w=>w.replace(/ing$/,'e')},
+
+                  // -ing plain  (helping→help, reading→read, fast→fast)
+                  {id:'ing', test:w=>w.length>5&&/ing$/.test(w),
+                    apply:w=>w.replace(/ing$/,'')},
+
+                  // -ed with consonant-doubling reversal  (stopped→stop, planned→plan)
+                  {id:'eddbl', test:w=>w.length>4&&/ed$/.test(w)&&DOUBLES.test(w.slice(0,-2)),
+                    apply:w=>w.replace(/(.)\1ed$/,'$1')},
+
+                  // -ed with e-restoration  (loved→love, moved→move, hoped→hope)
+                  {id:'ede', test:w=>w.length>4&&/[^aeiou]ed$/.test(w),
+                    apply:w=>w.replace(/ed$/,'e')},
+
+                  // -ed plain  (played→play, used→use)
+                  {id:'ed', test:w=>w.length>4&&/ed$/.test(w),
+                    apply:w=>w.replace(/ed$/,'')},
+
+                  // -er (comparative / agent): taller→tall, runner→run
+                  // Consonant-doubling reversal first: runner→run
+                  {id:'erdbl', test:w=>w.length>4&&/er$/.test(w)&&DOUBLES.test(w.slice(0,-2)),
+                    apply:w=>w.replace(/(.)\1er$/,'$1')},
+                  // -er with e-restoration: lover→love, maker→make
+                  {id:'ere', test:w=>w.length>4&&/[^aeiou]er$/.test(w),
+                    apply:w=>w.replace(/er$/,'e')},
+                  // -er plain: taller→tall, older→old (skip if in PROTECT)
+                  {id:'er', test:w=>w.length>5&&/er$/.test(w),
+                    apply:w=>w.replace(/er$/,'')},
+
+                  // -est: tallest→tall, fastest→fast
+                  {id:'est', test:w=>w.length>5&&/est$/.test(w),
+                    apply:w=>w.replace(/est$/,'')},
+
+                  // -ly: quickly→quick, badly→bad (skip if in PROTECT)
+                  {id:'ly', test:w=>w.length>5&&/ly$/.test(w),
+                    apply:w=>w.replace(/ly$/,'')},
+
+                  // -s plural: cats→cat, dogs→dog
+                  // Only if NOT ending in ss/us/is/os/as (those are already singular)
+                  {id:'s', test:w=>w.length>4&&/[^ssuioa]s$/.test(w)&&!/ss$/.test(w),
+                    apply:w=>w.replace(/s$/,'')},
+
+                  // -es: boxes→box, matches→match
+                  // -ches/-shes/-xes/-zes → drop es
+                  {id:'es', test:w=>w.length>4&&/(?:ch|sh|x|z)es$/.test(w),
+                    apply:w=>w.replace(/es$/,'')},
+
+                  // -ves → -f/-fe  (leaves→leaf, knives→knife)
+                  {id:'ves', test:w=>w.length>4&&/ves$/.test(w),
+                    apply:w=>w.replace(/ves$/,'f')},
+
+                  // ── PASS C: Deep Derivational (passes 4-5) ────────────────────────
+                  {id:'ary', test:w=>w.length>6&&/ary$/.test(w), apply:w=>w.replace(/ary$/,'')},
+                  {id:'ory', test:w=>w.length>6&&/ory$/.test(w), apply:w=>w.replace(/ory$/,'')},
+                  {id:'ure', test:w=>w.length>6&&/ure$/.test(w), apply:w=>w.replace(/ure$/,'')},
+                  {id:'age', test:w=>w.length>5&&/age$/.test(w), apply:w=>w.replace(/age$/,'e')},
+                  {id:'ize2', test:w=>w.length>6&&/ize$/.test(w), apply:w=>w.replace(/ize$/,'')},
+                  {id:'ise2', test:w=>w.length>6&&/ise$/.test(w), apply:w=>w.replace(/ise$/,'')},
+                  {id:'ify', test:w=>w.length>6&&/ify$/.test(w), apply:w=>w.replace(/ify$/,'y')},
+                  {id:'ate', test:w=>w.length>6&&/ate$/.test(w), apply:w=>w.replace(/ate$/,'')},
+
+  ];
+
+  function stemWord(w){
+    if(!w||w.length<=3)return w;
+    if(PROTECT.has(w))return w;
+
+    let current=w;
+    // Run up to 5 passes; each pass tries rules in order, applies first match, then re-checks
+    for(let pass=0;pass<5;pass++){
+      let fired=false;
+      for(const rule of RULES){
+        if(rule.test(current)){
+          const candidate=rule.apply(current);
+          // Safety: never shrink below 3 chars; never produce same string
+          if(candidate&&candidate.length>=3&&candidate!==current){
+            current=candidate;
+            fired=true;
+            break; // restart from pass 0 with new current
+          }
+        }
+      }
+      if(!fired)break; // no rule applied → done
+    }
+    // De-duplicate consecutive identical vowels introduced by stemming
+    current=current.replace(/([aeiou])\1+/g,'$1');
+    return current;
+  }
+
+  return { stemWord, PROTECT };
+})();
+
+// ── ENHANCED nlpTok ─────────────────────────────────────────────────
+// Replaces the basic tokenizer. Now: phrase-aware (compound phrases
+// become single tokens), feeds SpellCorrector vocabulary, stems via
+// NLPStemmer, and filters stopwords.
+function nlpTok(text){
+  if(!text)return[];
+  SpellCorrector.feed(text); // grow spell vocab
+  const tokens=PhraseDetector.tokenizeWithPhrases(text);
+  return tokens.filter(t=>t.length>2&&!SW.has(t));
+}
+
+const SEED=``.trim(); //removed temporarily and i am fully aware of  it
+
+const OPN=['Analyzing the retrieved passages,','After ranked retrieval:','The top-scoring nodes reveal:','Synthesis from retrieved corpus:','Here is what the corpus shows:'];
+const CON=['Furthermore,','This implies that','Consequently,','Additionally,','In essence,'];
+const CLO=['This reflects the highest BM25-ranked passages in the current corpus.','Further queries will refine retrieval toward higher-confidence passages.','This synthesis is grounded in Okapi BM25 ranked passages.'];
+
+// ── KG CONCEPT SEED ─────────────────────────────────────────────────
+// Teaches the Knowledge Graph core English concept relationships so it
+// can reason about is-a, type-of, part-of from the very first query.
+
+const KG_SEED=``.trim(); //removed to keep space temporarily plus not a really efficient way to learn
+
+// ── BM25 ───────────────────────────────────────────────────────────
+class BM25{
+  constructor(k1=1.5,b=0.75){this.k1=k1;this.b=b;this.docs=[];this.df={};this._avgdl=0;this.vocabSz=0;}
+  tok(t){return nlpTok(t);}
+  addDoc(sent,src='seed'){
+    const tokens=this.tok(sent);if(tokens.length<3)return false;
+    const tf={};tokens.forEach(t=>tf[t]=(tf[t]||0)+1);
+    new Set(tokens).forEach(t=>this.df[t]=(this.df[t]||0)+1);
+    this.docs.push({text:sent.trim(),tokens,tf,src});
+    const N=this.docs.length;this._avgdl=((this._avgdl*(N-1))+tokens.length)/N;
+    this.vocabSz=Object.keys(this.df).length;
+    // Feed spell corrector vocabulary
+    if(typeof SpellCorrector!=='undefined')SpellCorrector.feed(sent);
+    return true;
+  }
+  score(qt,doc){
+    let s=0;const N=this.docs.length||1;const dl=doc.tokens.length;
+    qt.forEach(term=>{
+      const tf=doc.tf[term]||0;if(!tf)return;
+      const df=this.df[term]||0;
+      const idf=Math.log((N-df+0.5)/(df+0.5)+1);
+      const tfn=(tf*(this.k1+1))/(tf+this.k1*(1-this.b+this.b*dl/(this._avgdl||1)));
+      s+=idf*tfn;
+    });
+    return s;
+  }
+  proj128(qt){
+    const r=new Float32Array(128);
+    qt.forEach(t=>{
+      const df=this.df[t]||0;const N=this.docs.length||1;
+      const idf=df>0?Math.log((N-df+0.5)/(df+0.5)+1):1;
+      let h=5381;for(let i=0;i<t.length;i++)h=((h<<5)+h+t.charCodeAt(i))>>>0;
+      r[h%128]=Math.max(r[h%128],idf);
+    });
+    const mx=Math.max(...r)||1;return Array.from(r).map(x=>x/mx);
+  }
+  // ── Core query — plain BM25 on raw tokens, used internally ──────
+  _queryRaw(q,K=7){
+    const qt=this.tok(q);
+    const scored=this.docs.map((d,i)=>({d,i,score:this.score(qt,d)}));
+    scored.sort((a,b)=>b.score-a.score);
+    return{results:scored.slice(0,K),qterms:qt,proj:this.proj128(qt)};
+  }
+  // ── Public query — synonym-expanded + phrase-boosted ─────────────
+  query(q,K=7){
+    // Parse with NLP engine for expansion + intent
+    const parsed=QueryParser.parse(q);
+    const qt=[...new Set(parsed.expandedTokens)];
+    const baseQt=[...new Set(parsed.baseTokens)];
+    const phraseTerms=new Set(qt.filter(t=>t.includes('_')));
+
+    // Score: base BM25 on expanded terms + phrase bonus + recency nothing (no date)
+    const scored=this.docs.map((d,i)=>{
+      // Primary BM25 score on expanded query
+      let s=this.score(qt,d);
+      // Phrase bonus: phrase token hit = extra 1.6× the phrase's individual BM25 contribution
+      for(const ph of phraseTerms){
+        if(d.tf[ph])s+=this.score([ph],d)*1.6;
+      }
+      // Exact-match bonus: base tokens (unstemmed) that appear literally in text
+      for(const bt of baseQt){
+        if(d.text.toLowerCase().includes(bt))s+=0.15;
+      }
+      // Source-tier boost: prefer live-fetched docs over seed
+      if(d.src&&d.src!=='seed'&&d.src!=='brain')s*=1.05;
+      return{d,i,score:s};
+    });
+    scored.sort((a,b)=>b.score-a.score);
+    return{results:scored.slice(0,K),qterms:qt,proj:this.proj128(qt),parsed};
+  }
+}
+
+// ── COSINE SYNTHESIS (TF-IDF + MMR) ────────────────────────────────
+class CosineSynth{
+  constructor(){this.sentences=[];this.idf={};this.docCount=0;this._dirty=true;}
+
+  _tok(text){
+    return nlpTok(text);
+  }
+
+  _rebuildIDF(){
+    const df={};
+    for(const s of this.sentences){
+      const seen=new Set(this._tok(s.text));
+      for(const t of seen)df[t]=(df[t]||0)+1;
+    }
+    const N=this.sentences.length||1;
+    this.idf={};
+    for(const[t,d] of Object.entries(df))this.idf[t]=Math.log((N+1)/(d+1))+1;
+    this.docCount=N;this._dirty=false;
+  }
+
+  _vec(text,expandForQuery=false){
+    if(this._dirty)this._rebuildIDF();
+    let toks=this._tok(text);
+    // When building a QUERY vector, expand with synonyms so cosine
+    // similarity picks up synonym-bearing sentences
+    if(expandForQuery&&typeof SynonymLexicon!=='undefined'){
+      toks=SynonymLexicon.expandTokens(toks);
+    }
+    const tf={};for(const t of toks)tf[t]=(tf[t]||0)+1;
+    const vec={};let norm=0;
+    for(const[t,c] of Object.entries(tf)){
+      const idf=this.idf[t]||Math.log((this.docCount+1)/1)+1;
+      const v=(1+Math.log(c))*idf;
+      vec[t]=v;norm+=v*v;
+    }
+    norm=Math.sqrt(norm)||1;
+    for(const t in vec)vec[t]/=norm;
+    return vec;
+  }
+
+  _cos(a,b){
+    let dot=0;
+    for(const t in a)if(b[t])dot+=a[t]*b[t];
+    return dot;
+  }
+
+  // Multi-pass sentence extraction — much richer than the original single regex
+  train(text){
+    const candidates=new Set();
+    // Pass 1: standard sentence boundary
+    (text.match(/[^.!?\n]{20,}[.!?]+/g)||[]).forEach(s=>candidates.add(s.trim()));
+    // Pass 2: colon-introduced clauses (definitions, enumerations)
+    text.split(/:\s+/).filter(l=>l.length>40).forEach(s=>candidates.add(s.trim().replace(/\s+/g,' ')));
+    // Pass 3: semicolon-separated independent clauses
+    text.split(/;\s+/).filter(l=>l.length>40).forEach(s=>candidates.add(s.trim().replace(/\s+/g,' ')));
+    // Pass 4: em-dash / parenthetical clauses
+    text.split(/[—–]\s*/).filter(l=>l.length>40).forEach(s=>candidates.add(s.trim().replace(/\s+/g,' ')));
+    // Pass 5: comma-separated clauses with subject+verb (clausal coordination)
+    text.split(/,\s+(?:and|but|or|so)\s+/).filter(l=>l.length>30).forEach(s=>candidates.add(s.trim().replace(/\s+/g,' ')));
+    // Pass 6: quoted/parenthetical standalone
+    text.split(/["()]+/).filter(l=>l.length>40).forEach(s=>candidates.add(s.trim().replace(/\s+/g,' ')));
+    for(const clean of candidates){
+      if(clean.length>30&&clean.split(' ').length>5&&
+        !/^[A-Z\s\d]{8,}$/.test(clean)&&// skip all-caps headers
+        !/^(see also|references|external|navigation|contents)/i.test(clean)){
+        this.sentences.push({text:clean});
+      this._dirty=true;
+        }
+    }
+  }
+
+  _mmr(queryVec,candidates,k,lambda=0.65){
+    const selected=[];const remaining=[...candidates];
+    while(selected.length<k&&remaining.length>0){
+      let bestIdx=-1,bestScore=-Infinity;
+      for(let i=0;i<remaining.length;i++){
+        const rel=this._cos(queryVec,remaining[i].vec);
+        const maxSim=selected.length===0?0:Math.max(...selected.map(s=>this._cos(s.vec,remaining[i].vec)));
+        const score=lambda*rel-(1-lambda)*maxSim;
+        if(score>bestScore){bestScore=score;bestIdx=i;}
+      }
+      if(bestIdx<0)break;
+      selected.push(remaining[bestIdx]);remaining.splice(bestIdx,1);
+    }
+    return selected;
+  }
+
+  // ── Content-word extractor (used by string-chainer) ──────────────
+  // Now stems each content word via NLPStemmer so that "running" and
+  // "run", "organisation" and "organise", etc. still form connections.
+  _contentWords(text){
+    const CW_SW=new Set('the a an is are was were be been being have has had do does did will would could should may might must can to of in on at for with by from up about into through during before after between among since until against under over above below upon within without across along around behind beyond inside outside and or but nor yet so if that this these those it its we they them he she her him who which what when where how why'.split(' '));
+    return text.toLowerCase().replace(/[^a-z\s]/g,' ').split(/\s+/)
+    .filter(w=>w.length>3&&!CW_SW.has(w))
+    .map(w=>NLPStemmer.stemWord(w));
+  }
+
+  // ── Sentence type classifier ──────────────────────────────────────
+  // Returns a type label for diversity enforcement
+  _sentType(text){
+    const t=text.toLowerCase();
+    if(/\b(is|are|was|were)\s+(a|an|the|defined|known|called|described|considered|regarded)\b/.test(t))return'def';
+    if(/\b(because|therefore|thus|hence|consequently|as a result|due to|caused|leads? to|results? in)\b/.test(t))return'causal';
+    if(/\b(includes?|contains?|consists? of|comprises?|such as|for example|for instance|namely)\b/.test(t))return'enum';
+    if(/\b(however|but|although|though|whereas|despite|on the other hand|in contrast|unlike)\b/.test(t))return'contrast';
+    if(/\b(first|second|third|initially|then|next|finally|subsequently|later|earlier|before|after)\b/.test(t))return'temporal';
+    if(/\b(increased|decreased|grew|fell|rose|dropped|expanded|reduced|more than|less than|percent|%)\b/.test(t))return'quantitative';
+    return'descriptive';
+  }
+
+  // ── String-chaining engine ────────────────────────────────────────
+  // Builds "strings" — chains of sentences connected by shared content
+  // words (lego-style). Each string grows as long as the chain holds.
+  // Returns {strings, bridges, paragraphs, txt, trans, topScore}
+  gen(query,_anchorToks=[],targetWords=300,kg=null){
+    if(this.sentences.length<3)return{txt:'',trans:[],paragraphs:[],strings:[],bridges:[],topScore:0};
+    if(this._dirty)this._rebuildIDF();
+
+    // Use synonym-expanded query vector for broader cosine matching
+    const qVec=this._vec(query,true); // true = expand synonyms
+    const qVecPlain=this._vec(query,false);
+
+    // Parse intent so we can bias sentence type selection
+    const intent=(typeof QueryParser!=='undefined')?QueryParser.parse(query).intent:{id:'info'};
+
+    let scored=this.sentences
+    .map(s=>({...s,vec:this._vec(s.text,false)}))
+    .map(s=>({...s,
+      rel:this._cos(qVec,s.vec)*0.7+this._cos(qVecPlain,s.vec)*0.3
+    }))
+    .filter(s=>s.rel>0.015) // lowered threshold for synonym-expanded hits
+    .sort((a,b)=>b.rel-a.rel);
+    if(!scored.length)return{txt:'',trans:[],paragraphs:[],strings:[],bridges:[],topScore:0};
+
+    // ── Concept coherence filter ─────────────────────────────────
+    // Only apply if KG has meaningful coverage; otherwise pure cosine
+    if(kg&&kg.triples.length>10){
+      const cluster=kg.queryCluster(query);
+      if(cluster.size>2){
+        scored=scored.map(s=>({
+          ...s,
+          conceptScore:kg.sentenceClusterScore(s.text,cluster),
+                              // Blend: cosine dominates early, concept score adds once KG is rich
+                              blended:s.rel*0.65+kg.sentenceClusterScore(s.text,cluster)*0.35
+        }))
+        // Relaxed gate: keep if cosine is decent OR concept touches cluster
+        .filter(s=>s.rel>0.08||s.conceptScore>=0.1)
+        .sort((a,b)=>b.blended-a.blended);
+      }
+    }
+    if(!scored.length)return{txt:'',trans:[],paragraphs:[],strings:[],bridges:[],topScore:0};
+
+    // Pool: take top 80 by score; want enough sentences to fill targetWords
+    const pool=scored.slice(0,Math.min(80,scored.length));
+    // Aim for at least 8 sentences; scale up for larger targetWords
+    const want=Math.max(8,Math.min(Math.ceil(targetWords/12),pool.length));
+
+    // Intent → preferred sentence type (boost matching types)
+    const INTENT_TYPE_PREF={
+      'define':   'def',
+      'mechanism':'causal',
+      'causal':   'causal',
+      'list':     'enum',
+      'history':  'temporal',
+      'compare':  'contrast',
+      'quantitative':'quantitative',
+    };
+    const preferredType=INTENT_TYPE_PREF[intent.id]||null;
+
+    // Enhanced MMR — inject type-diversity penalty + intent type boost
+    const typeCounts={};
+    const chosen=[];
+    const remaining=[...pool];
+    while(chosen.length<want&&remaining.length>0){
+      let bestIdx=-1,bestScore=-Infinity;
+      for(let i=0;i<remaining.length;i++){
+        const s=remaining[i];
+        const rel=this._cos(qVec,s.vec);
+        const maxSim=chosen.length===0?0:Math.max(...chosen.map(c=>this._cos(c.vec,s.vec)));
+        // Type penalty: if we already have ≥2 of this type, reduce score
+        const sType=this._sentType(s.text);
+        const typePenalty=(typeCounts[sType]||0)>=2?0.18:0;
+        // Intent boost: sentences matching the preferred type score higher
+        const intentBoost=(preferredType&&sType===preferredType&&(typeCounts[sType]||0)<3)?0.12:0;
+        // Def-first: for define intent, strongly prefer the first definitional sentence
+        const defFirst=(intent.id==='define'&&sType==='def'&&chosen.length===0)?0.25:0;
+        const score=0.65*rel-0.35*maxSim-typePenalty+intentBoost+defFirst;
+        if(score>bestScore){bestScore=score;bestIdx=i;}
+      }
+      if(bestIdx<0)break;
+      const pick=remaining[bestIdx];
+      chosen.push(pick);
+      const t=this._sentType(pick.text);
+      typeCounts[t]=(typeCounts[t]||0)+1;
+      remaining.splice(bestIdx,1);
+    }
+    if(!chosen.length)return{txt:'',trans:[],paragraphs:[],strings:[],bridges:[],topScore:0};
+
+    // ── String-chaining: lego-connect sentences by shared content words ──
+    // Each sentence's content words form its "connector pegs".
+    // Two sentences connect if they share ≥1 content word (or ≥2 if both long).
+    // We greedily grow strings; a sentence joins the current string if it
+    // connects to the last member, otherwise it starts a new string.
+    const withWords=chosen.map(s=>({...s,cw:new Set(this._contentWords(s.text)),type:this._sentType(s.text)}));
+
+    // Sort by original corpus order first to preserve narrative flow within strings
+    withWords.sort((a,b)=>this.sentences.findIndex(x=>x.text===a.text)-this.sentences.findIndex(x=>x.text===b.text));
+
+    function connectStrength(cwA,cwB){
+      let shared=0;for(const w of cwA)if(cwB.has(w))shared++;
+      // Require at least 1 shared word; for very short sentences require at least 1 too
+      return shared;
+    }
+
+    // Build strings greedily: each sentence tries to attach to an existing open string
+    // by finding the string whose last sentence it best connects with.
+    const strings=[]; // each string = [{text,cw,type,rel,...}, ...]
+    const used=new Set();
+
+    for(const s of withWords){
+      if(used.has(s.text))continue;
+      // Find best existing string to attach to (by connection strength to its tail)
+      let bestStr=-1,bestStrength=0;
+      for(let si=0;si<strings.length;si++){
+        const tail=strings[si][strings[si].length-1];
+        const strength=connectStrength(tail.cw,s.cw);
+        // Min connection: 2 shared content words for longer sentences (>10 words), 1 for short
+        const wordCount=s.text.split(/\s+/).length;
+        const minReq=wordCount>10?2:1;
+        if(strength>=minReq&&strength>bestStrength){bestStrength=strength;bestStr=si;}
+      }
+      if(bestStr>=0){
+        strings[bestStr].push(s);
+      } else {
+        strings.push([s]);
+      }
+      used.add(s.text);
+    }
+
+    // Remove singleton strings (single isolated sentence) — merge them into the closest string
+    // or keep as standalone if no string has a good match
+    const singletons=strings.filter(str=>str.length===1);
+    const multiStrings=strings.filter(str=>str.length>1);
+    for(const lone of singletons){
+      const s=lone[0];
+      let bestStr=-1,bestStrength=0;
+      for(let si=0;si<multiStrings.length;si++){
+        // Check connection to any member of the string, not just tail
+        for(const member of multiStrings[si]){
+          const strength=connectStrength(member.cw,s.cw);
+          if(strength>bestStrength){bestStrength=strength;bestStr=si;}
+        }
+      }
+      if(bestStr>=0&&bestStrength>0){
+        multiStrings[bestStr].push(s);
+      } else {
+        multiStrings.push(lone); // keep as its own string
+      }
+    }
+    const finalStrings=multiStrings.length>0?multiStrings:strings;
+
+    // ── Inter-string bridge detection ─────────────────────────────
+    // Find shared content words between distinct strings → emit bridge note
+    const bridges=[];
+    for(let i=0;i<finalStrings.length;i++){
+      for(let j=i+1;j<finalStrings.length;j++){
+        const allCwI=new Set(finalStrings[i].flatMap(s=>[...s.cw]));
+        const allCwJ=new Set(finalStrings[j].flatMap(s=>[...s.cw]));
+        const shared=[];for(const w of allCwI)if(allCwJ.has(w)&&w.length>4)shared.push(w);
+        if(shared.length>=2){
+          bridges.push({from:i,to:j,concepts:shared.slice(0,4)});
+        }
+      }
+    }
+
+    // ── Render: each string becomes a paragraph ────────────────────
+    const paragraphs=finalStrings.map((str,si)=>{
+      const text=str.map(s=>s.text).join(' ');
+      return text;
+    });
+
+    // Add inter-string bridge annotations inline as italicised connector sentences
+    const paragraphsWithBridges=[...paragraphs];
+    // Insert bridge notes between paragraphs (offset by prior insertions)
+    const bridgeNotes={};
+    for(const br of bridges){
+      const concepts=br.concepts.join(', ');
+      const note=`[Concepts "${concepts}" also thread through the section above and below, connecting these ideas.]`;
+      // Mark the connection between the two strings
+      if(!bridgeNotes[br.to])bridgeNotes[br.to]=[];
+      bridgeNotes[br.to].push(note);
+    }
+
+    const finalParagraphs=[];
+    for(let i=0;i<paragraphsWithBridges.length;i++){
+      if(bridgeNotes[i]){
+        for(const note of bridgeNotes[i])finalParagraphs.push(note);
+      }
+      finalParagraphs.push(paragraphsWithBridges[i]);
+    }
+
+    const txt=finalParagraphs.join('\n\n');
+    const trans=chosen.slice(0,5).map(s=>({k:s.text.slice(0,28),probs:[
+      {tok:'relevance',p:+(s.rel||0).toFixed(3)},
+                                          {tok:'type',p:+(1/(Object.keys(typeCounts).length||1)).toFixed(3)},
+                                          {tok:'string-conn',p:+(s.blended||s.rel||0).toFixed(3)}
+    ]}));
+
+    return{txt,trans,paragraphs:finalParagraphs,strings:finalStrings,bridges,topScore:scored[0]?.rel||0};
+  }
+}
+
+// ══════════════════════════════════════════════════════════════════
+// GRAMMAR-FIRST NLP ENGINE
+// Pipeline: tokenise → POS-tag → chunk NPs/VPs → parse clauses
+//           → extract typed triples → build knowledge graph
+//
+// No LLM. No regex fishing for surface patterns.
+// Every extraction is justified by grammatical role.
+// ══════════════════════════════════════════════════════════════════
+
+// ── 1. POS TAGGER ─────────────────────────────────────────────────
+// Rule-based, trained on suffix/context clues + a closed-class lexicon.
+// Tags: NN(noun) NNS(pl.noun) NNP(proper) VB(verb) VBD(past) VBZ(3sg)
+//       VBG(gerund) VBN(past-part) JJ(adj) RB(adv) DT(det) IN(prep)
+//       CC(conj) PRP(pronoun) MD(modal) TO CD(number) WP WDT
+class POSTagger{
+  constructor(){
+    // ── Closed-class sets (unambiguous words) ─────────────────────────
+    this.DET  =new Set('the,a,an,this,that,these,those,my,your,his,her,its,our,their,whose,some,any,no,enough,several,plenty,many,much,few,little,all,both,half,each,every,either,neither,another,such,quite,rather,double,twice'.split(','));
+    this.PREP =new Set('of in on at for with by from up about into through during before after between among since until against under over above below upon within without across along around behind beyond inside outside'.split(' '));
+    this.CONJ =new Set('and or but nor yet so although though however therefore thus hence because while since despite'.split(' '));
+    this.PRON =new Set('i me we us you he him she her they them it who whom ones one'.split(' '));
+    this.MOD  =new Set('can could will would shall should may might must need dare ought'.split(' '));
+    this.AUX  =new Set('is are was were be been being have has had do does did'.split(' '));
+    this.NEG  =new Set(['not',"n't",'never','no']);
+    this.ADV  =new Set('also very quite rather just only even still already now here there always often never sometimes usually generally largely mainly mostly partly perhaps probably certainly clearly especially particularly'.split(' '));
+    this.NUM  =/^\d[\d,\.]*(%|st|nd|rd|th)?$|^(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|hundred|thousand|million|billion|first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)$/i;
+    // Verb past-tense/past-participle irregular endings
+    this.V_PAST=/(?:ed|ied|ought|aught|ung|ank|unk|ove|ode|ew|rew|nned|rred|pped|tted|gged|mmed|lled|ssed)$/;
+
+    // ── Context-sensitive ambiguous words ────────────────────────────
+    // Words whose POS depends entirely on what's around them.
+    // We store a default and let the context passes override.
+    // Format: word → { default, rules:[{left?,right?,leftPos?,rightPos?,assign}] }
+    // Rules are checked in order; first match wins.
+    this.AMBIG={
+      // "to" — TO before verb, IN before noun
+      'to':{default:'TO',rules:[
+        {rightPos:/^(NN|NNS|NNP|DT|PRP)/,assign:'IN'},  // "to the office" → IN
+        {rightPos:/^(VB|VBG)/,assign:'TO'},              // "to run" → TO
+      ]},
+      // "that" — DT before noun, IN/CC as subordinator, PRP as pronoun
+      'that':{default:'IN',rules:[
+        {leftPos:/^(NN|NNP|NNS|VB|VBD|VBZ|VBN|AUX|MD)/,rightPos:/^(NN|NNP|DT|PRP|VB)/,assign:'IN'}, // "said that X" → IN
+        {rightPos:/^(NN|NNP|NNS)/,assign:'DT'},  // "that policy" → DT
+      ]},
+      // "which" — DT in NP, WDT in relative clause
+      'which':{default:'WDT',rules:[
+        {rightPos:/^(NN|NNP|NNS)/,assign:'DT'},
+      ]},
+      // "what" — DT or WP
+      'what':{default:'WP',rules:[
+        {rightPos:/^(NN|NNP|NNS)/,assign:'DT'},
+      ]},
+      // "for" — IN (preposition) or CC (conjunction "for = because")
+      'for':{default:'IN',rules:[
+        {leftPos:/^(NN|NNP|NNS|JJ|VBN)/,rightPos:/^(VB|VBG|MD)/,assign:'CC'}, // "important for building" → IN still; "worked hard, for they" → CC
+      ]},
+      // "like" — IN (similar to), VB (verb), or JJ (adjective "like-minded")
+      'like':{default:'IN',rules:[
+        {leftPos:/^(AUX|MD)/,assign:'VB'}, // "would like" → VB
+        {leftPos:/^(VB|VBD|VBZ)/,assign:'VB'}, // "looks like" → IN actually, keep default
+      ]},
+      // "well" — RB (adverb "did well"), JJ (adjective "is well"), NN (noun "a well")
+      'well':{default:'RB',rules:[
+        {leftPos:/^(AUX)/,assign:'JJ'}, // "is well" → JJ
+        {rightPos:/^(NN|NNP)/,assign:'JJ'}, // "well water" → JJ
+      ]},
+      // "other" — DT or JJ
+      'other':{default:'JJ',rules:[
+        {rightPos:/^(NN|NNP|NNS)/,assign:'JJ'},
+        {leftPos:/^(DT)/,assign:'JJ'}, // "the other" → JJ as head adjective
+      ]},
+      // "own" — DT (possessive marker) or VB ("they own the company")
+      'own':{default:'DT',rules:[
+        {leftPos:/^(AUX|MD|VB)/,assign:'VB'}, // "they own" → VB
+      ]},
+      // "right" — JJ, RB, NN, or VB
+      'right':{default:'JJ',rules:[
+        {leftPos:/^(AUX|MD)/,assign:'VB'}, // "should right" → VB
+        {leftPos:/^(RB|AUX)/,rightPos:/^(NN|NNP)/,assign:'JJ'}, // "right policy" → JJ
+        {rightPos:/^(VB|AUX)/,assign:'RB'}, // "right after" → RB
+      ]},
+      // "light" — NN or JJ
+      'light':{default:'NN',rules:[
+        {rightPos:/^(NN|NNP)/,assign:'JJ'}, // "light rain" → JJ
+        {leftPos:/^(DT|JJ)/,assign:'NN'},
+      ]},
+      // "close" — JJ, RB, VB
+      'close':{default:'JJ',rules:[
+        {leftPos:/^(AUX|MD|TO)/,assign:'VB'},
+        {leftPos:/^(RB)/,assign:'RB'},
+      ]},
+      // "just" — RB or JJ ("just cause")
+      'just':{default:'RB',rules:[
+        {rightPos:/^(NN|NNP)/,assign:'JJ'},
+      ]},
+      // "even" — RB ("even worse") or VB ("even out")
+      'even':{default:'RB',rules:[
+        {leftPos:/^(AUX|MD|TO)/,assign:'VB'},
+      ]},
+      // "still" — RB or VB or JJ
+      'still':{default:'RB',rules:[
+        {leftPos:/^(AUX|MD)/,assign:'VB'},
+        {rightPos:/^(NN|NNP)/,assign:'JJ'},
+      ]},
+      // "left" — VBD (past of leave), JJ (remaining/direction), NN
+      'left':{default:'VBD',rules:[
+        {leftPos:/^(DT|JJ|RB)/,assign:'JJ'}, // "the left side" → JJ
+        {rightPos:/^(NN|NNP)/,assign:'JJ'},
+      ]},
+      // "set" — VBD, NN, or VB
+      'set':{default:'VBD',rules:[
+        {leftPos:/^(DT|JJ)/,assign:'NN'},
+        {leftPos:/^(AUX|MD|TO)/,assign:'VB'},
+      ]},
+      // "state" — NN or VB
+      'state':{default:'NN',rules:[
+        {leftPos:/^(AUX|MD|TO)/,assign:'VB'},
+      ]},
+      // "head" — NN or VB
+      'head':{default:'NN',rules:[
+        {leftPos:/^(AUX|MD|TO)/,assign:'VB'},
+      ]},
+      // "back" — NN, RB, or VB
+      'back':{default:'NN',rules:[
+        {leftPos:/^(AUX|MD|TO)/,assign:'VB'},
+        {leftPos:/^(VB|VBD|VBZ)/,assign:'RB'}, // "go back" → RB
+        {rightPos:/^(NN|NNP)/,assign:'JJ'}, // "back door" → JJ
+      ]},
+      // "up" — IN or RB or JJ ("up trend")
+      'up':{default:'IN',rules:[
+        {leftPos:/^(VB|VBD|VBZ|VBG)/,assign:'RB'}, // "stood up" → RB
+        {rightPos:/^(NN|NNP)/,assign:'JJ'}, // "up trend" → JJ
+      ]},
+      // "down" — IN, RB, JJ, VB
+      'down':{default:'RB',rules:[
+        {leftPos:/^(AUX|MD|TO)/,assign:'VB'},
+        {rightPos:/^(NN|NNP)/,assign:'JJ'}, // "down payment" → JJ
+      ]},
+      // "its" — DT (possessive det) or PRP ("its own")
+      'its':{default:'DT',rules:[]},
+      // "mine" — PRP (pronoun) or NN (noun "a gold mine")
+      'mine':{default:'PRP',rules:[
+        {leftPos:/^(DT|JJ)/,assign:'NN'},
+        {rightPos:/^(NN|NNP)/,assign:'JJ'}, // "mine shaft" → JJ
+      ]},
+    };
+
+    // ── Noun-ings: -ing words that are head nouns, not gerunds ────────
+    this.NOUN_INGS=new Set('building ceiling clothing coating crossing dealing drawing dwelling earning feeling filing flooring funding gathering greeting heading heating helping housing hunting keeping kindling landing leading learning licensing lighting lining listing living loading lodging meaning meeting modeling morning nursing offering opening painting parking paving piping plumbing pricing printing proceeding proceedings racing reading roofing ruling saving savings seating setting shipping shopping siding sighting sightings sitting skiing smoking spending staffing stamping string surfing teaching thing training understanding uprising warning wedding writing king ring sing wing spring sting swing'.split(' '));
+
+    // ── Adjective -ed forms (not past participles in context) ─────────
+    this.ADJ_EDS=new Set('advanced aged alleged annoyed armed ashamed assured balanced bored concentrated concerned confused crooked curved dedicated depressed detailed determined developed devoted disappointed disciplined educated embarrassed enclosed encouraged engaged enhanced excited experienced extended fixed focused frightened frustrated gifted guarded guaranteed guided handicapped hardened informed inspired integrated interested isolated limited mixed motivated noted opposed organized outraged pleased pointed polished prepared pronounced proposed protected qualified raised refined related relaxed renewed reserved resolved respected retired revised scared settled shaped skilled sophisticated specialized stressed structured surprised talented tired troubled trusted united varied worried wounded'.split(' '));
+  }
+
+  // ── Morphological suffix → base POS ────────────────────────────────
+  // Returns a POS tag from word shape alone, NO context.
+  // Context passes override this for ambiguous words.
+  _suffix(w){
+    if(/(?:tion|sion|ment|ness|ity|ism|age|ure|ance|ence|acy|phy|logy|nomy|graphy)$/.test(w))return'NN';
+    if(/(?:ist|ian|eer|eur)$/.test(w)&&w.length>4)return'NN'; // activist, musician
+    if(/(?:er|or|ee|ant|ent|ary|ery|ory)$/.test(w)&&w.length>5)return'NN'; // teacher, director
+    if(this.NOUN_INGS.has(w))return'NN';
+    if(/ing$/.test(w)&&w.length>4)return'VBG'; // default -ing = gerund
+    if(this.ADJ_EDS.has(w))return'JJ';
+    if(this.V_PAST.test(w)&&w.length>3)return'VBN'; // default -ed = past-part
+    if(/(?:ful|less|ous|ive|al|ic|ish|able|ible)$/.test(w))return'JJ';
+    if(/(?:ate|ent|ant)$/.test(w)&&w.length>5)return'JJ'; // alternate, different
+    if(/ly$/.test(w)&&w.length>3)return'RB';
+    if(/(?:ize|ise|ify)$/.test(w)&&w.length>4)return'VB';
+    if(/s$/.test(w)&&w.length>3&&!/ss$/.test(w))return'NNS';
+    return null;
+  }
+
+  // ── Context rule checker ─────────────────────────────────────────────
+  // Checks a single ambiguity rule given the prev and next tokens.
+  _ruleMatches(rule,prev,next){
+    if(rule.leftPos&&!(prev&&rule.leftPos.test(prev.pos)))return false;
+    if(rule.rightPos&&!(next&&rule.rightPos.test(next.pos)))return false;
+    if(rule.left&&!(prev&&prev.w===rule.left))return false;
+    if(rule.right&&!(next&&next.w===rule.right))return false;
+    return true;
+  }
+
+  tag(text){
+    const raw=text.replace(/["""'']/g,'"').replace(/[—–]/g,' — ').split(/\s+/).filter(Boolean);
+    const tokens=raw.map(r=>({
+      raw:r,
+      w:r.toLowerCase().replace(/[^a-z0-9']/g,''),
+                             pos:'NN',
+                             lemma:'',
+                             _locked:false // locked tokens were assigned by unambiguous rules
+    }));
+
+    // ══ PASS 1: Unambiguous closed-class and morphology ════════════════
+    for(let i=0;i<tokens.length;i++){
+      const t=tokens[i];
+      const w=t.w;
+      if(!w){t.pos='PUNCT';t._locked=true;continue;}
+      // Punctuation
+      if(/^[—–\-]+$/.test(t.raw)){t.pos='PUNCT';t._locked=true;continue;}
+      // Unambiguous closed-class
+      if(this.MOD.has(w)) {t.pos='MD';t._locked=true;continue;}
+      if(this.AUX.has(w)) {t.pos='AUX';t._locked=true;continue;}
+      if(this.NEG.has(w)) {t.pos='RB';t._locked=true;continue;}
+      if(this.NUM.test(w)){t.pos='CD';t._locked=true;continue;}
+      // Ambiguous words → defer to Pass 2; set default now
+      if(this.AMBIG[w]){t.pos=this.AMBIG[w].default;continue;}
+      // "to" special case
+      if(w==='to'){t.pos='TO';continue;}
+      // Other determiners (unambiguous subset)
+      if(this.DET.has(w)){t.pos='DT';t._locked=true;continue;}
+      // Pronouns (unambiguous)
+      if(this.PRON.has(w)){t.pos='PRP';t._locked=true;continue;}
+      // Conjunctions (unambiguous ones: and/or/but/nor — leave "for/since/while" unlocked)
+      if(/^(and|or|but|nor)$/.test(w)){t.pos='CC';t._locked=true;continue;}
+      // Subordinating conj/prep — ambiguous, defer
+      if(this.CONJ.has(w)){t.pos='CC';continue;}
+      if(this.PREP.has(w)){t.pos='IN';continue;}
+      if(this.ADV.has(w)){t.pos='RB';continue;}
+      // Proper noun: capitalised + not sentence-start
+      if(/^[A-Z]/.test(t.raw)&&i>0){t.pos='NNP';continue;}
+      // Morphological suffix
+      const suf=this._suffix(w);
+      if(suf){t.pos=suf;continue;}
+      t.pos='NN'; // default
+    }
+
+    // ══ PASS 2: Context-driven disambiguation ══════════════════════════
+    // Window: prev2, prev, cur, next, next2
+    // Runs forward then backward to catch both left- and right-dependent rules.
+    for(let i=0;i<tokens.length;i++){
+      const t=tokens[i];
+      const w=t.w;
+      const prev=tokens[i-1]||null;
+      const prev2=tokens[i-2]||null;
+      const next=tokens[i+1]||null;
+      const next2=tokens[i+2]||null;
+
+      // ── Ambiguous word table ────────────────────────────────────────
+      if(this.AMBIG[w]){
+        for(const rule of this.AMBIG[w].rules){
+          if(this._ruleMatches(rule,prev,next)){t.pos=rule.assign;break;}
+        }
+        continue; // don't fall through to structural rules for these
+      }
+
+      if(t._locked)continue;
+
+      // ── NNP used as pre-modifier (adjective role) ───────────────────
+      // "American policy", "Israeli forces", "French government",
+      // "October attacks", "London bombing" — proper noun + common noun head
+      // The NNP is acting as a modifier; keep it NNP but the chunker will
+      // treat it as a JJ-equivalent. We tag it JJP (proper adjective).
+      if(t.pos==='NNP'&&next&&/^(NN|NNS)$/.test(next.pos)){
+        t.pos='JJP'; // proper adjective — modifies the following common noun
+        continue;
+      }
+      // NNP before another NNP followed by a common noun: first NNP = JJP too
+      // "Israeli Defense Forces" → Israeli=JJP, Defense=JJP, Forces=NNP
+      if(t.pos==='NNP'&&next&&next.pos==='NNP'&&next2&&/^(NN|NNS)$/.test(next2.pos)){
+        t.pos='JJP';continue;
+      }
+
+      // ── AUX/MD/TO + open-class word ────────────────────────────────
+      if(prev&&(prev.pos==='AUX'||prev.pos==='MD'||prev.pos==='TO')){
+        if(t.pos==='NN'||t.pos==='NNS'){t.pos='VB';continue;} // "should increase"
+        if(t.pos==='VBN'){t.pos='VBN';continue;} // "was founded"
+        if(t.pos==='VBG'){t.pos='VBG';continue;} // "is running"
+        // AUX + NN that ends in -ed → past participle
+        if(t.pos==='NN'&&/(?:ed|en)$/.test(t.w)){t.pos='VBN';continue;}
+      }
+
+      // ── AUX/MD CHAIN: was/were + being + VBN ───────────────────────
+      // "was being attacked" — "being" = VBG, "attacked" = VBN
+      if(prev&&prev.w==='being'&&prev2&&prev2.pos==='AUX'){
+        if(t.pos==='VBN'||t.pos==='JJ'){t.pos='VBN';continue;}
+      }
+
+      // ── DT/JJ + VBG → noun (the meeting, a training) ───────────────
+      if(prev&&(prev.pos==='DT'||prev.pos==='JJ'||prev.pos==='JJP')&&t.pos==='VBG'){
+        t.pos='NN';continue;
+      }
+      // DT/JJ + VB → noun context (the increase, a decline)
+      if(prev&&(prev.pos==='DT'||prev.pos==='JJ')&&t.pos==='VB'){
+        t.pos='NN';continue;
+      }
+
+      // ── VBN before noun head → adjective ───────────────────────────
+      // "increased activity", "established norms", "related topics"
+      if(t.pos==='VBN'&&next&&/^(NN|NNS|NNP)$/.test(next.pos)){
+        t.pos='JJ';continue;
+      }
+      // VBN after comma before noun → also adjective
+      if(t.pos==='VBN'&&prev&&prev.pos==='PUNCT'&&next&&/^(NN|NNS)$/.test(next.pos)){
+        t.pos='JJ';continue;
+      }
+
+      // ── NN + VBG → compound noun (parliament meeting) ──────────────
+      if(prev&&/^(NN|NNP)$/.test(prev.pos)&&t.pos==='VBG'&&(!next||/^(NN|IN|PUNCT|CC)$/.test(next.pos||''))){
+        t.pos='NN';continue;
+      }
+
+      // ── Adverb before JJ/VBN/RB → stays RB ─────────────────────────
+      if(t.pos==='RB'&&next&&/^(JJ|VBN|RB)$/.test(next.pos))continue;
+
+      // ── "so/for/since/while/although" POS by position ──────────────
+      // These are in CONJ by default; check if they're actually prepositions
+      if(w==='since'||w==='while'){
+        // "since 1990" / "while working" → IN/CC (already CC default, fine)
+        // Context: "since" before DT/CD = IN; before VBG = CC
+        if(w==='since'){
+          if(next&&(next.pos==='CD'||next.pos==='DT'))t.pos='IN';
+          else if(next&&/^VB/.test(next.pos))t.pos='CC';
+        }
+      }
+
+      // ── IN after verb before NNP/NN: preposition ───────────────────
+      if(t.pos==='CC'&&prev&&/^(VB|VBD|VBZ|VBN|VBG|AUX)$/.test(prev.pos)&&next&&/^(DT|NN|NNP)$/.test(next.pos)){
+        if(/^(for|since|until|during|from|through|with|against|on|in|at|by)$/.test(w))t.pos='IN';
+      }
+
+      // ── NNS after DT/JJ + singular noun = possessive context ────────
+      // Not tagging PRP$ but flag for subject extraction: leave as-is
+
+      // ── CD before NN = quantifier (stays CD) ────────────────────────
+      // nothing to do
+
+      // ── "not" / negation inside verb chain → RB (already set) ──────
+    }
+
+    // ══ PASS 3: Forward coherence sweep ═══════════════════════════════
+    // Catch patterns that require knowing what was decided in Pass 2.
+    for(let i=1;i<tokens.length-1;i++){
+      const prev=tokens[i-1],cur=tokens[i],next=tokens[i+1];
+
+      // JJP + NN → confirm: NNP modifier is correct, no change needed
+
+      // RB + JJ/VBN + NN → the JJ/VBN is a pre-modifier adjective, not predicate
+      if(prev.pos==='RB'&&(cur.pos==='JJ'||cur.pos==='VBN')&&next&&/^(NN|NNS)$/.test(next.pos)){
+        cur.pos='JJ';
+      }
+
+      // VB + IN + DT/NN → the IN is a preposition (keep), VB is a transitive verb
+      // "runs in the city" — no change needed
+
+      // CC between two VBs → both are verbs (join: "rises and falls")
+      if(prev.pos&&prev.pos.startsWith('VB')&&cur.pos==='CC'&&next&&next.pos.startsWith('VB')){
+        // Fine as-is
+      }
+
+      // JJ + JJ + NN: first JJ might actually be RB if it ends in -ly
+      if(prev.pos==='JJ'&&/ly$/.test(prev.w)&&cur.pos==='JJ'&&next&&/^(NN|NNS)$/.test(next.pos)){
+        prev.pos='RB'; // "heavily armed forces" → "heavily" = RB
+      }
+
+      // NNP directly followed by VB (not AUX) → NNP is subject, VB is predicate
+      // "America leads" — NNP = NNP (correct), VB = VBZ (may need fix)
+      if(prev.pos==='NNP'&&cur.pos==='VB'&&!/^(is|are|was|were|be|been|have|has|had|do|does|did)$/.test(prev.w)){
+        cur.pos='VBZ'; // 3sg present
+      }
+
+      // IN + VBG → gerund as object of preposition (keep VBG)
+      // "by running", "after leaving" — no change needed
+
+      // DT + NNP → the NNP is head of a definite NP; if next is NN, NNP stays
+      // "the Israeli attack" — Israeli should be JJP (caught in Pass 2)
+
+      // VBN after comma inside NP → adjective
+      if(prev.pos==='PUNCT'&&cur.pos==='VBN'&&next&&/^(NN|NNS|NNP)$/.test(next.pos)){
+        cur.pos='JJ';
+      }
+    }
+
+    // ══ PASS 4: Backward coherence sweep ══════════════════════════════
+    for(let i=tokens.length-2;i>=0;i--){
+      const prev=i>0?tokens[i-1]:null, cur=tokens[i], next=tokens[i+1];
+      // Catch verb→noun mismatches that a forward sweep misses
+      // e.g., "the attack resulting in" -> if "attack" was VB, change to NN
+      if(prev && (prev.pos==='DT' || prev.pos.startsWith('JJ')) && cur.pos.startsWith('VB') && next && (next.pos==='IN' || next.pos.startsWith('VB'))){
+        cur.pos='NN';
+      }
+    }
+
+    // ══ PASS 5: Cross-clause agreement check ══════════════════════════
+    for(let i=1;i<tokens.length-1;i++){
+      const prev=tokens[i-1], cur=tokens[i], next=tokens[i+1];
+      // Check subject-verb number agreement: NNS + VBZ -> mismatch fix
+      if(prev.pos==='NNS' && cur.pos==='VBZ'){
+        cur.pos='VB'; // plural verb base
+      }
+      // Fix gerund-as-noun leaks in prepositional contexts
+      if(prev.pos==='IN' && cur.pos==='NN' && cur.w.endsWith('ing')){
+        cur.pos='VBG';
+      }
+    }
+
+    // ══ Lemmatisation ════════════════════════════════════════════════
+    for(const t of tokens){
+      if(t.pos.startsWith('V')){
+        let l=t.w;
+        if(t.pos==='VBZ'){
+          l=l.replace(/ies$/,'y').replace(/(?:ches|shes|xes|zes)es$/,'').replace(/(?:es|s)$/,'');
+        }
+        if(t.pos==='VBD'||t.pos==='VBN'){
+          if(/(.)\1ed$/.test(l))l=l.replace(/(.)\1ed$/,'$1');
+          else if(/ied$/.test(l))l=l.replace(/ied$/,'y');
+          else if(/[^aeiou]ed$/.test(l))l=l.replace(/ed$/,'e');
+          else l=l.replace(/ed$/,'');
+        }
+        if(t.pos==='VBG'){
+          if(/(.)\1ing$/.test(l))l=l.replace(/(.)\1ing$/,'$1');
+          else if(/[^aeiouwxy]ing$/.test(l))l=l.replace(/ing$/,'e');
+          else l=l.replace(/ing$/,'');
+        }
+        t.lemma=l||t.w;
+      } else {
+        let l=t.w;
+        if(/ies$/.test(l)&&l.length>4)l=l.replace(/ies$/,'y');
+        else if(/ves$/.test(l)&&l.length>4)l=l.replace(/ves$/,'f');
+        else if(/(?:ches|shes|xes|zes)$/.test(l))l=l.replace(/es$/,'');
+        else if(/[^ssuioa]s$/.test(l)&&l.length>4&&!/ss$/.test(l))l=l.replace(/s$/,'');
+        t.lemma=l||t.w;
+      }
+    }
+
+    return tokens;
+  }
+}
+
+// ── 2. NOUN-PHRASE CHUNKER ────────────────────────────────────────
+// Finds NP spans: (DT|PRP$)? (JJ|RB)* (NN|NNS|NNP)+
+// Returns [{start,end,head,text,tokens}]
+function chunkNP(tokens){
+  const NPS=[];
+  let i=0;
+  while(i<tokens.length){
+    // Optional determiner
+    let start=i;
+    if(i<tokens.length&&tokens[i].pos==='DT')i++;
+    // Optional adj run (JJ,RB,VBN used as JJ)
+    while(i<tokens.length&&(tokens[i].pos==='JJ'||tokens[i].pos==='VBN'&&tokens[i+1]&&/^NN/.test(tokens[i+1].pos)))i++;
+    // Required noun head(s)
+    const nStart=i;
+    while(i<tokens.length&&(/^NN/.test(tokens[i].pos)||tokens[i].pos==='CD'))i++;
+    if(i>nStart){ // at least one noun found
+      const span=tokens.slice(start,i);
+      const head=tokens.slice(nStart,i).map(t=>t.w).join(' ');
+      const full=span.map(t=>t.raw).join(' ');
+      // Strip leading determiners from head for concept key
+      const key=head.replace(/^(the|a|an|this|that|these|those|its|their|our)\s+/i,'').toLowerCase().trim();
+      if(key.length>1)NPS.push({start,end:i,head:key,text:full,tokens:span});
+    } else {
+      i=Math.max(i,start+1); // advance at least 1 to avoid infinite loop
+    }
+  }
+  return NPS;
+}
+
+// ── 3. SENTENCE PARSER → CLAUSE STRUCTURES ───────────────────────
+// Extracts Subject–Verb–Object / Subject–Copula–Predicate structures.
+// Guards heavily against fragment subjects, PP-as-object errors, and
+// cross-clause subject bleeding that caused garbage like:
+//   "third the british felt relates-to with indian reaction"
+//   "british raj increases over almost"
+function parseClauses(tokens){
+  const clauses=[];
+
+  // Hard boundary tokens: clause starts fresh after these
+  const isBoundary=(t)=>
+  t.pos==='CC'||t.pos==='PUNCT'||
+  (t.pos==='IN'&&/^(that|which|who|whom|whose|when|where|because|since|although|though|while|if|unless|until|before|after|as)$/i.test(t.w));
+
+  // Is a token a "noise" word for subject purposes?
+  // Ordinals, numbers, vague quantifiers, and sentence-connectors make bad subjects
+  const isSubjNoise=(t)=>
+  t.pos==='CD'||// numbers: "three the british"
+  /^(third|fourth|fifth|first|second|last|next|later|early|late|new|old|former|latter|other|another|same|certain|several|many|few|some|more|most|less|least|such|various|different|no|much|only|even|just|still|also|both|either|neither|quite|rather|very|ones|one|those|these|any|all|each|every)$/i.test(t.w)||
+  t.pos==='RB'||// adverbs bleed into subject: "almost" etc.
+  t.pos==='PRP'||// pronouns don't make good KG subjects
+  t.pos==='IN'; // prepositions are not subjects
+
+  // Build an index of verb positions so we know clause boundaries
+  const verbPos=new Set();
+  for(let i=0;i<tokens.length;i++){
+    if(tokens[i].pos==='AUX'||tokens[i].pos==='MD'||tokens[i].pos.startsWith('VB'))verbPos.add(i);
+  }
+
+  let i=0;
+  while(i<tokens.length){
+    if(!(tokens[i].pos==='AUX'||tokens[i].pos==='MD'||tokens[i].pos.startsWith('VB'))){i++;continue;}
+
+    // ── Collect aux+verb chain ────────────────────────────────────
+    const verbStart=i;
+    const verbToks=[];
+    while(i<tokens.length&&(tokens[i].pos==='AUX'||tokens[i].pos==='MD'||tokens[i].pos==='TO'))
+      verbToks.push(tokens[i++]);
+    if(i<tokens.length&&tokens[i].pos.startsWith('VB')){verbToks.push(tokens[i++]);}
+    else if(verbToks.length>0&&verbToks[verbToks.length-1].pos.startsWith('VB')){/* already */}
+    else{continue;}
+
+    const mainVerb=verbToks.filter(t=>t.pos.startsWith('VB')).pop();
+    if(!mainVerb)continue;
+    const verbLemma=mainVerb.lemma||mainVerb.w;
+    const negated=verbToks.some(t=>t.pos==='RB'&&/^(not|n't|never|no)$/.test(t.w));
+    const isCopula=/^(be|is|are|was|were|been|become|became|remain|seem|appear|stay|look|feel|sound|taste|smell|get)$/.test(verbLemma);
+    // Passive: BE-form + past-participle, but NOT copula and NOT "established/founded"
+    // followed by a bare preposition (those are pattern-matched separately with year guard)
+    const isPassive=verbToks.some(t=>t.pos==='AUX'&&/^(is|are|was|were|be|been|being)$/.test(t.w))
+    &&mainVerb.pos==='VBN'
+    &&!isCopula
+    // Extra guard: don't treat "was established/founded/created in [noun]" as passive clause
+    // — that fires the established pattern without a year guard, producing garbage
+    &&!/^(establish|found|creat|form|incorporat|organiz|build|construct)/.test(verbLemma);
+
+    // ── Find subject: walk LEFT, stop at hard boundaries and verb positions ──
+    let subject=null;
+    let sEnd=-1;
+    for(let j=verbStart-1;j>=0;j--){
+      if(isBoundary(tokens[j]))break;
+      if(j<verbStart-1&&verbPos.has(j))break;
+      if(/^NN/.test(tokens[j].pos)||tokens[j].pos==='NNP'||tokens[j].pos==='PRP'){
+        sEnd=j+1;
+        let sStart=j;
+        while(sStart>0){
+          const prev=tokens[sStart-1];
+          if(isBoundary(prev))break;
+          if(isSubjNoise(prev))break;
+          if(verbPos.has(sStart-1))break;
+          if(/^(NN|NNP|JJ|DT|CD)/.test(prev.pos)){sStart--;}
+          else break;
+        }
+        while(sStart<sEnd&&isSubjNoise(tokens[sStart]))sStart++;
+        while(sStart<sEnd&&tokens[sStart].pos==='DT')sStart++;
+
+        const subjTokens=tokens.slice(sStart,sEnd);
+        if(!subjTokens.some(t=>/^NN/.test(t.pos)||t.pos==='NNP'||t.pos==='PRP'))break;
+        // Max 4 tokens — 5-word subjects are almost always clause fragments
+        if(subjTokens.length>4)break;
+        // Reject if any token in the NP is a relative/subordinating word
+        if(subjTokens.some(t=>/^(which|that|who|whom|whose|where|when|because|since|although|though|while|if|unless|as|referring|including|regarding|concerning)$/i.test(t.w)))break;
+
+        subject=subjTokens.map(t=>t.w).join(' ')
+        .replace(/^(the|a|an|this|that|these|those|its|their|our|any|all)\s+/i,'').trim();
+        if(/^(of|in|on|at|by|for|with|from|to|into|about|through|over|under|between|among|during|since|until|after|before|around|against)\b/i.test(subject))subject=null;
+        if(subject&&subject.split(' ').length===1&&/^(thing|aspect|part|point|way|kind|type|form|case|fact|area|field|issue|matter|concept|idea|use|role|effect|impact|result|outcome|process|system|period|time|year|place|group|set|number|amount|level|degree|rate|range)$/i.test(subject))subject=null;
+        break;
+      }
+    }
+
+    if(!subject||subject.length<2)continue;
+
+    // ── Find object / predicate: walk RIGHT from after the verb ──
+    let object=null,objType='obj';
+    let ri=i;
+    // Skip adverbs immediately after verb
+    while(ri<tokens.length&&tokens[ri].pos==='RB')ri++;
+    // Skip "to" for infinitives
+    if(ri<tokens.length&&tokens[ri].pos==='TO')ri++;
+    while(ri<tokens.length&&tokens[ri].pos==='RB')ri++;
+
+    if(ri<tokens.length){
+      if(tokens[ri].pos==='JJ'&&isCopula){
+        const adj=tokens[ri].w;
+        if(!/(?:ing)$/.test(adj)){object=tokens[ri].lemma||adj;objType='adj';ri++;}
+
+      } else if(/^(NN|NNP|DT)/.test(tokens[ri].pos)){
+        // NP object — cap at 4 tokens (was 5; prevents long clause fragments)
+        let oStart=ri;
+        if(tokens[ri].pos==='DT')ri++;
+        while(ri<tokens.length&&tokens[ri].pos==='JJ')ri++;
+        const headStart=ri;
+        while(ri<tokens.length&&/^NN/.test(tokens[ri].pos))ri++;
+        if(ri>headStart){
+          const objToks=tokens.slice(oStart,ri);
+          if(objToks.length<=4){
+            const objText=objToks.map(t=>t.w).join(' ')
+            .replace(/^(the|a|an|this|that|these|those|its|their|our)\s+/i,'').trim();
+            // Reject if object looks like a verb phrase or infinitive
+            // e.g. "refer to", "used to", "going to"
+            if(!/^(refer|used|going|trying|able|likely|known|said|told|made|given|taken|seen|done|come|become|turned|ended|started|began|continued)$/i.test(objText.split(' ')[0])){
+              object=objText;
+              // Absorb short "of X" qualifier only if X ≤ 2 words and starts with noun
+              if(ri<tokens.length&&tokens[ri].w==='of'&&ri+1<tokens.length&&/^NN/.test(tokens[ri+1].pos)){
+                const ppStart=ri+1;let ppEnd=ppStart;
+                while(ppEnd<tokens.length&&/^NN/.test(tokens[ppEnd].pos))ppEnd++;
+                const ppHead=tokens.slice(ppStart,ppEnd).map(t=>t.w).join(' ');
+                if(ppHead&&ppHead.split(' ').length<=2){object=object+' of '+ppHead;ri=ppEnd;}
+              }
+              objType='noun';
+            }
+          }
+        }
+
+      } else if(tokens[ri].pos==='IN'&&isCopula){
+        const prep=tokens[ri].w;ri++;
+        // Hard-block prepositions that routinely produce adverbial noise or verb-phrase fragments
+        if(/^(over|through|during|throughout|across|along|around|by|until|since|before|after|within|without|despite|regarding|concerning|following|including|as|like|than|whether|though|although|because|while|when|where|how|why|that|which|who)$/.test(prep)){
+          // skip — adverbial or subordinating
+        } else {
+          let oStart=ri;
+          if(ri<tokens.length&&tokens[ri].pos==='DT')ri++;
+          const ppHeadStart=ri;
+          while(ri<tokens.length&&/^NN/.test(tokens[ri].pos))ri++;
+          if(ri>ppHeadStart&&ri-ppHeadStart<=3){
+            const ppNoun=tokens.slice(ppHeadStart,ri).map(t=>t.w).join(' ');
+            // Must have at least one content word AND not start with a verb form
+            const firstW=ppNoun.split(' ')[0];
+            const firstTok=tokens[ppHeadStart];
+            if(ppNoun.split(' ').some(w=>!SW.has(w))&&!(firstTok&&firstTok.pos.startsWith('VB'))){
+              object=prep+' '+ppNoun;objType='pp';
+            }
+          }
+        }
+      }
+    }
+
+    // ── Quality gates before storing ─────────────────────────────
+    if(!subject||!object)continue;
+    // Both subject and object must contain at least one non-stopword
+    const hasContent=(s)=>s.split(' ').some(w=>w.length>2&&!SW.has(w));
+    if(!hasContent(subject)||!hasContent(object))continue;
+    // Reject if subject == object (self-referential noise)
+    if(subject.toLowerCase().replace(/\s+/g,' ')===object.toLowerCase().replace(/\s+/g,' '))continue;
+    // For non-copula clauses, reject 'relates-to' triples unless both subject and object
+    // are at least 2 words or proper nouns — bare single common nouns produce too much noise
+    if(objType==='noun'){
+      const verbRel=this?._verbToRel?.(verbLemma)||'relates-to';
+      // 'relates-to' and 'acted-on' are low-signal; require higher specificity
+      if((verbRel==='relates-to'||verbRel==='acted-on')&&subject.split(' ').length===1&&object.split(' ').length===1)continue;
+    }
+
+    clauses.push({subject,verb:verbLemma,object,objType,negated,isCopula,isPassive,
+      // ── Tense & surface verb ────────────────────────────────────
+      // Derive tense from the auxiliary + main-verb sequence so that
+      // _addTriple can store it and generateIntro can use the right form.
+      tense:(()=>{
+        const auxWords=verbToks.filter(t=>t.pos==='AUX'||t.pos==='MD').map(t=>t.w);
+        const mvPos=mainVerb.pos;
+        if(auxWords.some(a=>/^(will|would|shall|should)$/.test(a)))return'future';
+        if(auxWords.some(a=>/^(was|were|had)$/.test(a)))return'past';
+        if(auxWords.some(a=>/^(is|are|am|has|have|been|being)$/.test(a)))return'present';
+        if(mvPos==='VBD')return'past';
+        if(mvPos==='VBZ')return'present';
+        if(mvPos==='VBG')return'continuous';
+        return'present';// default
+      })(),
+                 surfaceVerb:verbToks.map(t=>t.raw||t.w).join(' '),
+                 raw:tokens.slice(Math.max(0,verbStart-3),Math.min(tokens.length,i+2)).map(t=>t.raw).join(' ')});
+  }
+  return clauses;
+}
+
+// ── 4. ADJECTIVE-EQUIVALENCE TRACKER ─────────────────────────────
+// Learns that "nice" and "good" are used in similar contexts → related.
+// Uses co-occurrence: if two adj appear describing the same noun head,
+// or in the same topic cluster, they are semantically proximate.
+class AdjTracker{
+  constructor(){
+    // noun → Set<adj> (adjectives that describe this noun)
+    this.nounAdj={};
+    // adj → Set<adj> (adjs that co-occur on same noun)
+    this.adjSim={};
+    // adj → {freq, contexts:[noun,...]}
+    this.adjMeta={};
+  }
+  observe(noun,adj){
+    noun=noun.toLowerCase().trim();adj=adj.toLowerCase().trim();
+    if(!noun||!adj||noun.length<2||adj.length<2)return;
+    if(!this.nounAdj[noun])this.nounAdj[noun]=new Set();
+    this.nounAdj[noun].add(adj);
+    if(!this.adjMeta[adj])this.adjMeta[adj]={freq:0,contexts:[]};
+    this.adjMeta[adj].freq++;
+    if(this.adjMeta[adj].contexts.length<20)this.adjMeta[adj].contexts.push(noun);
+  }
+  // After observing, build similarity index
+  buildSim(){
+    this.adjSim={};
+    const nouns=Object.keys(this.nounAdj);
+    for(const noun of nouns){
+      const adjs=[...this.nounAdj[noun]];
+      for(let a=0;a<adjs.length;a++){
+        for(let b=a+1;b<adjs.length;b++){
+          if(!this.adjSim[adjs[a]])this.adjSim[adjs[a]]=new Map();
+          if(!this.adjSim[adjs[b]])this.adjSim[adjs[b]]=new Map();
+          const ca=this.adjSim[adjs[a]].get(adjs[b])||0;
+          const cb=this.adjSim[adjs[b]].get(adjs[a])||0;
+          this.adjSim[adjs[a]].set(adjs[b],ca+1);
+          this.adjSim[adjs[b]].set(adjs[a],cb+1);
+        }
+      }
+    }
+  }
+  // Get adjs most similar to a given adj (co-describe same nouns)
+  similar(adj,n=5){
+    if(!this.adjSim[adj])return[];
+    return [...this.adjSim[adj].entries()].sort((a,b)=>b[1]-a[1]).slice(0,n).map(([a])=>a);
+  }
+  // Get all adjs ever used to describe a noun
+  adjectivesOf(noun){
+    return [...(this.nounAdj[noun.toLowerCase()] || new Set())];
+
+  }
+}
+// Fix typo above – use ASCII parens
+AdjTracker.prototype.adjectivesOf=function(noun){return[...(this.nounAdj[noun.toLowerCase()]||new Set())];};
+
+// ── 5. KNOWLEDGE GRAPH ────────────────────────────────────────────
+// Stores grammar-verified triples: {subj, rel, obj, confidence, src}
+// Every triple must come from a parsed clause — no raw regex on full text.
+class KnowledgeGraph{
+  constructor(){
+    this.triples=[];
+    this.conceptIdx={};   // concept → Set<related concept>
+    this.topicWords={};   // word → Set<source topics>
+    this.adjTracker=new AdjTracker();
+    this.tagger=new POSTagger();
+    this._simDirty=false;
+  }
+
+  _cap(s){return s?s[0].toUpperCase()+s.slice(1):'';}
+
+  // ── Text pre-cleaning ─────────────────────────────────────────────
+  // Strip markup noise that corrupts the NLP pipeline before any parsing.
+  _preClean(text){
+    return(text||'')
+    .replace(/\[\d+\]/g,'')                                   // [1] inline citations
+    .replace(/\[[^\]]{1,40}\]/g,'')                          // [note 3], [citation needed]
+    .replace(/\((?:born|died|c\.|ca\.|fl\.|b\.|d\.)[\s\d–\-,a-zA-Z]{1,25}\)/gi,'') // (born 1820)
+    .replace(/={2,}[^=\n]*={2,}/g,'')                        // == Section Headers ==
+    .replace(/\bpp?\.\s*\d[\d–\-,\s]*/g,'')                  // pp. 123–145
+    .replace(/\bvol\.\s*\d+/gi,'')                            // vol. 3
+    .replace(/\b[Ee]d\.\s+[A-Z][a-z]+/g,'')                  // Ed. Smith
+    // ── News-specific noise ──────────────────────────────────────
+    // Date-location datelines: "GAZA, Oct 12 (Reuters) —"
+    .replace(/^[A-Z][A-Z\s,]{2,30},\s*(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[^—\n]{0,30}[—\-]/gm,'')
+    // Wire service tags: "(Reuters)", "(AP)", "(AFP)"
+    .replace(/\([A-Z]+\)\s*/g,'')
+    // Strip standalone numbers/ordinals at sentence start that bleed into subjects
+    .replace(/^(\d+\.\s+|\d+\)\s+)/gm,'')
+    // "Breaking:" / "WATCH:" / "UPDATE:" prefixes
+    .replace(/^(?:BREAKING|UPDATE|WATCH|DEVELOPING|LIVE)[:\s]+/gim,'')
+    .replace(/\s+/g,' ').trim();
+  }
+
+  // ── Proper-noun merging ────────────────────────────────────────────
+  // Merge multi-word proper-noun phrases into single underscore-joined
+  // tokens BEFORE the tokeniser runs.  This prevents "of" / "the" inside
+  // a name from firing as hard clause boundaries.
+  //
+  // "Indian Rebellion of 1857"   → "Indian_Rebellion_of_1857"
+  // "East India Company"         → "East_India_Company"
+  // "British North America"      → "British_North_America"
+  // "Battle of Plassey"          → "Battle_of_Plassey"
+  //
+  // _clean() later converts underscores back to spaces so stored triple
+  // subjects/objects read naturally.
+  _mergeProperNouns(text){
+    let t=text;
+    // Pass 1 only: "CapWord(s) <connector> CapWord(s)"
+    // Cap the connector-joined pass at 2 iterations to avoid runaway chains
+    for(let pass=0;pass<2;pass++){
+      t=t.replace(
+        /\b([A-Z][A-Za-z]{1,25}(?:_[A-Za-z]{1,25}){0,2})\s+(of|the|in|de|la|le|du|von|van|der|den)\s+([A-Z][A-Za-z]{1,25}(?:_[A-Za-z]{1,25}){0,2})\b/g,
+                  (_,a,p,b)=>`${a}_${p}_${b}`
+      );
+    }
+    // Adjacent caps: only merge exactly 2 consecutive capitalized words, NOT 3+
+    // This prevents "Evening Hamas Netanyahu" → "Evening_Hamas_Netanyahu" (garbage)
+    // Only fire once so chains don't accumulate
+    t=t.replace(
+      /\b([A-Z][A-Za-z]{1,25})\s+([A-Z][A-Za-z]{1,25})\b(?!\s+[A-Z])/g,
+                (_,a,b)=>`${a}_${b}`
+    );
+    return t;
+  }
+
+  _clean(s){
+    return(s||'').toLowerCase()
+    .replace(/^(the|a|an|this|that|these|those|its|their|our|its|any|all)\s+/,'')
+    .replace(/_/g,' ')                  // restore merged proper-noun spaces
+    .replace(/[^a-z0-9\s\-]/g,'').replace(/\s+/g,' ').trim().slice(0,60);
+  }
+
+  // ── Concept canonicalisation ──────────────────────────────────────
+  // Only stem the head word of common-noun concepts.
+  // Proper noun phrases (containing any originally-capitalized word, or known
+  // place/person names) are stored as-is to prevent "Netanyahu" → "netanyahu" etc.
+  _canon(s){
+    if(!s)return s;
+    const words=s.trim().split(' ');
+    if(words.length===1){
+      // Single word: stem only if it looks like a common noun (all lowercase after cleaning)
+      // Don't stem if it's a known proper noun (starts with capital in original — but by this
+      // point _clean() has lowercased everything, so we use a length+suffix heuristic:
+      // proper-noun-like single tokens are usually ≥5 chars with no derivational suffix)
+      const head=words[0];
+      const stem=NLPStemmer.stemWord(head);
+      return(stem&&stem.length>=3)?stem:head;
+    }
+    // Multi-word: only stem the final word (head noun), leave modifiers untouched
+    const head=words[words.length-1];
+    const stem=NLPStemmer.stemWord(head);
+    words[words.length-1]=(stem&&stem.length>=3)?stem:head;
+    return words.join(' ');
+  }
+
+  // ── Hard noise guards for subject/object strings ─────────────────
+  _isNoisy(s){
+    if(!s||s.length<2)return true;
+    // Pure pronouns/function words that slipped through cleaning
+    const NOISE=new Set(['he','she','it','we','they','them','him','her','his','its','our','who','whom','what','which','this','that','these','those','there','here','then','now','also','even','just','very','more','most','some','such','each','both','many','much','few','own','same','other','others','ones','one','two','three','four','five','six','seven','eight','nine','ten','first','second','third','last','next','later',
+                        // Calendar/time words that almost always produce garbage triples like "june causes 12day war"
+                        'january','february','march','april','may','june','july','august','september','october','november','december',
+                        'monday','tuesday','wednesday','thursday','friday','saturday','sunday',
+                        'today','yesterday','tomorrow','morning','evening','night','week','month','year','decade',
+                        // Vague intensifiers that bleed into subjects
+                        'intense','strong','significant','major','critical','recent','new','old','large','small','high','low',
+    ]);
+    if(NOISE.has(s))return true;
+    // Single calendar month by itself = noise
+    if(/^(jan|feb|mar|apr|jun|jul|aug|sep|oct|nov|dec)\b/i.test(s)&&s.split(' ').length<=1)return true;
+    // Starts with a preposition
+    if(/^(of|in|on|at|by|for|with|from|to|into|about|through|over|under|between|among|during|since|until|after|before|around|against|without|within|upon|along|across|behind|beyond|inside|outside)\b/.test(s))return true;
+    // All stopwords
+    if(s.split(' ').every(w=>SW.has(w)))return true;
+    // Single vague/generic head word
+    if(s.split(' ').length===1&&/^(thing|aspect|part|point|way|kind|type|form|case|fact|area|field|issue|matter|concept|idea|use|role|effect|impact|result|outcome|process|system|period|time|year|place|group|set|number|amount|level|degree|rate|range|something|anything|nothing|everything|someone|anyone|everyone|nobody|anybody|everybody|somebody|chapter|enclave|siege|attack|operation|raid|cabinet|war|camp|front|zone|region|sector|side)$/.test(s))return true;
+    // Subject/object is an abstract fragment — contains "surrounding", "regarding",
+    // "following", "concerning", "including" as first or second word (dangling participle noise)
+    if(/\b(surrounding|regarding|following|concerning|including|involving|affecting|relating|pertaining|considering|approaching)\b/.test(s))return true;
+    // Object looks like a sentence fragment starting with an article-less multi-word phrase
+    // where all words are lowercase common words — "wave of antisemitism", "new chapter" etc.
+    // Heuristic: if ≥3 words, none are proper nouns, and first word is abstract → noise
+    const words=s.split(' ');
+    if(words.length>=3&&words.every(w=>/^[a-z]/.test(w))){
+      const firstIsAbstract=/^(wave|surge|rise|fall|spread|growth|loss|lack|use|need|part|form|type|kind|size|scale|level|degree|amount|number|series|set|range|variety|sense|aspect|element|factor|feature|nature|state|case|point|issue|problem|question|matter|reason|source|basis|way|means|measure|step|stage|phase|period|time|moment|day|night|week|month|year|decade|century|era|age|end|start|beginning|middle|centre|center|top|bottom|side|edge|front|back|base|line|limit|boundary|border|area|zone|region|district|sector|zone|class|group|team|force|unit|body|system|network|structure|framework|pattern|model|approach|method|process|policy|plan|program|project|strategy|initiative|effort|attempt|move|action|response|reaction|decision|choice|option|solution|answer|result|outcome|impact|effect|consequence|implication|conclusion|finding|evidence|data|information|knowledge|understanding|view|opinion|argument|claim|theory|idea|concept|notion|principle|rule|law|standard|norm|value|goal|aim|purpose|role|function|task|duty|right|power|authority|control|influence|pressure|tension|conflict|crisis|challenge|opportunity|threat|risk|danger|problem|difficulty|obstacle|barrier|limitation|constraint|condition|situation|context|environment|background|history|origin|cause|reason|basis|ground|foundation|basis)$/.test(words[0]);
+      if(firstIsAbstract)return true;
+    }
+    return false;
+  }
+
+  _addTriple(subj,rel,obj,conf,src,tense,surfaceVerb){
+    if(rel==='relates-to')return;
+    const s=this._clean(subj),o=this._clean(obj);
+    if(!s||!o||s===o)return;
+    if(s.split(' ').length>5||o.split(' ').length>5)return;
+    if(this._isNoisy(s)||this._isNoisy(o))return;
+    if(this._isVerbPhraseObj(o))return;
+    // Raise the global confidence floor — noisy sources (news, live text) produce
+    // many low-conf triples; only accept ones with genuine grammatical support
+    if((conf||0.5)<0.55)return;
+    // Extra noise guard: reject if either term looks like a run-on proper noun merge
+    // (more than 3 underscore-joined tokens = merger went too far)
+    if((s.match(/\s/g)||[]).length>4||(o.match(/\s/g)||[]).length>4)return;
+    // Dedup with confidence boost — preserve tense of highest-conf version
+    const existing=this.triples.find(t=>t.subj===s&&t.rel===rel&&t.obj===o);
+    if(existing){
+      existing.conf=Math.min(1,existing.conf+0.12);
+      // If new tense is more specific (not 'present' default), upgrade
+      if(tense&&tense!=='present'&&existing.tense==='present')existing.tense=tense;
+      if(surfaceVerb&&!existing.surfaceVerb)existing.surfaceVerb=surfaceVerb;
+      return;
+    }
+    const cs=this._canon(s),co=this._canon(o);
+    const nearDup=this.triples.find(t=>this._canon(t.subj)===cs&&t.rel===rel&&this._canon(t.obj)===co);
+    if(nearDup){nearDup.conf=Math.min(1,nearDup.conf+0.08);return;}
+    this.triples.push({subj:s,rel,obj:o,conf:conf||0.5,src,tense:tense||'present',surfaceVerb:surfaceVerb||rel});
+    if(!this.conceptIdx[s])this.conceptIdx[s]=new Set();
+    if(!this.conceptIdx[o])this.conceptIdx[o]=new Set();
+    this.conceptIdx[s].add(o);this.conceptIdx[o].add(s);
+    if(cs!==s){
+      if(!this.conceptIdx[cs])this.conceptIdx[cs]=new Set();
+      this.conceptIdx[cs].add(o);this.conceptIdx[o].add(cs);
+    }
+  }
+
+  // ── Post-extraction guard: reject verb-phrase / adverbial objects ──
+  // Called before _addTriple in the pattern-matching section of learn()
+  _isVerbPhraseObj(obj){
+    if(!obj)return true;
+    // Object starts with a verb in base/infinitive form
+    const first=obj.split(' ')[0].toLowerCase();
+    return /^(refer|use|used|go|get|make|take|give|come|see|know|find|call|show|tell|keep|let|put|set|turn|bring|begin|start|end|try|seem|appear|become|remain|stay|help|need|want|feel|think|say|mean|include|contain|consist|exist|occur|happen|result|lead|cause|allow|enable|prevent|require|involve|provide|create|develop|form|produce|support|represent|describe|indicate|suggest|determine|define|measure|consider|regard|recognize|understand|learn|apply|work|serve|function|act|operate|perform|play|establish|maintain|continue|follow|depend|rely|focus|aim|tend|seem|appear)$/.test(first);
+  }
+  // Also runs lightweight pattern matching for constructs the clause
+  // parser misses: appositives, dash-definitions, "such as" examples,
+  // "part of" membership, and causal "because/since/so that" chains.
+  learn(text,src=''){
+    const cleaned=this._preClean(text);
+    const sents=cleaned.match(/[^.!?\n]{10,}[.!?]+/g)||[cleaned];
+    for(const sentRaw of sents){
+      // sentMerged: proper-noun units joined with underscores for the clause parser
+      // sentRaw: original (cleaned) text for the regex pattern matchers below
+      const sentMerged=this._mergeProperNouns(sentRaw);
+      const tokens=this.tagger.tag(sentMerged);
+      const clauses=parseClauses(tokens);
+      const nps=chunkNP(tokens);
+
+      for(const cl of clauses){
+        const{subject:subj,verb,object:obj,objType,negated,isCopula,isPassive,tense,surfaceVerb}=cl;
+        if(negated)continue;
+
+        // ── Copula: "X is/was/became/remains Y" ──────────────
+        if(isCopula){
+          if(objType==='noun'){
+            this._addTriple(subj,'is-a',obj,0.85,src,tense,surfaceVerb);
+          } else if(objType==='adj'){
+            this._addTriple(subj,'has-property',obj,0.8,src,tense,surfaceVerb);
+            this.adjTracker.observe(subj,obj);this._simDirty=true;
+          } else if(objType==='pp'){
+            const prep=obj.split(' ')[0];
+            const ppObj=obj.split(' ').slice(1).join(' ');
+            const rel=
+            prep==='of'?'part-of':
+            prep==='in'||prep==='inside'||prep==='within'?'located-in':
+            prep==='from'||prep==='out'?'origin-of':
+            prep==='at'?'located-in':
+            prep==='for'?'used-for':
+            prep==='by'?'created-by':
+            prep==='with'?'associated-with':
+            prep==='about'?'concerns':
+            prep==='under'?'classified-under':
+            'related-to';
+            this._addTriple(subj,rel,ppObj,0.7,src,tense,surfaceVerb);
+          }
+        } else if(isPassive){
+          const passSubj=subj,passObj=obj||subj;
+          const looksLikeNP=(s)=>s&&s.split(' ').length>=2||(/^[A-Z]/.test(s||'')||!(SW.has(s||'')));
+          if(looksLikeNP(passSubj)&&looksLikeNP(passObj))
+            this._addTriple(passObj,'acted-on',passSubj,0.65,src,tense,surfaceVerb);
+        } else {
+          if(!obj)continue;
+          const rel=this._verbToRel(verb);
+          this._addTriple(subj,rel,obj,0.75,src,tense,surfaceVerb);
+          if(rel==='causes')this._addTriple(obj,'caused-by',subj,0.6,src,tense,surfaceVerb);
+          if(rel==='requires')this._addTriple(obj,'required-for',subj,0.55,src,tense,surfaceVerb);
+          if(rel==='derived-from')this._addTriple(obj,'gives-rise-to',subj,0.55,src,tense,surfaceVerb);
+        }
+      }
+
+      // ── Adjective observations from NPs ──────────────────────
+      for(const np of nps){
+        const adjs=np.tokens.filter(t=>t.pos==='JJ'||t.pos==='VBN').map(t=>t.w);
+        for(const adj of adjs){
+          this.adjTracker.observe(np.head,adj);
+          this._simDirty=true;
+        }
+      }
+
+      // ── Topic-word index: what words appear together in text ──
+      const contentWords=tokens.filter(t=>/^(NN|NNP|JJ|VB)/.test(t.pos)&&t.w.length>2&&!SW.has(t.w));
+      for(const tw of contentWords){
+        if(!this.topicWords[tw.lemma||tw.w])this.topicWords[tw.lemma||tw.w]=new Set();
+        this.topicWords[tw.lemma||tw.w].add(src);
+      }
+
+      // ── Supplemental pattern layer ────────────────────────────
+      // Catches definitional and structural patterns the clause parser misses.
+      // Uses sentRaw (unmerged) so patterns can match natural spacing.
+      const s=sentRaw.replace(/\s+/g,' ').trim();
+
+      // Pattern: "X, a/an/the Y[,]" — appositive definition
+      // e.g. "Python, a programming language, is..."
+      const appoPat=/\b([A-Z][a-z]{1,25}(?:\s+[A-Z]?[a-z]{1,20})?),\s+(?:a|an|the)\s+([a-z][a-z\s\-]{2,35}?)(?:,|\.|that|which|who)/g;
+      let m;
+      while((m=appoPat.exec(s))!==null){
+        const subj=this._clean(m[1]),obj=this._clean(m[2]);
+        if(subj&&obj&&subj!==obj)this._addTriple(subj,'is-a',obj,0.78,src);
+      }
+
+      // Pattern: "X — a Y" or "X: a Y" — em-dash / colon definition
+      const dashPat=/\b([A-Za-z][a-z]{1,25}(?:\s+[a-z]{1,20})?)\s*[—–:]\s*(?:a|an|the)\s+([a-z][a-z\s\-]{2,40}?)(?:\.|,|;|$)/g;
+      while((m=dashPat.exec(s))!==null){
+        const subj=this._clean(m[1]),obj=this._clean(m[2]);
+        if(subj&&obj&&subj!==obj)this._addTriple(subj,'defined-as',obj,0.82,src);
+      }
+
+      // Pattern: "such as X, Y, Z" — examples of containing class
+      // Capture the noun before "such as" as the class, X/Y/Z as members
+      const suchPat=/\b([a-z][a-z\s]{2,30}?)\s+such as\s+([a-z][a-z,\s]{2,60}?)(?:\.|,\s+(?:and|or|etc)|;|$)/gi;
+      while((m=suchPat.exec(s))!==null){
+        const cls=this._clean(m[1]);
+        if(!cls||cls.split(' ').length>4)continue;
+        const examples=m[2].split(/,\s*|\s+and\s+|\s+or\s+/).map(e=>this._clean(e)).filter(e=>e&&e.length>1&&e.split(' ').length<=4);
+        for(const ex of examples.slice(0,4)){
+          this._addTriple(ex,'is-a',cls,0.72,src);
+        }
+      }
+
+      // Pattern: "X including Y, Z" — membership
+      const inclPat=/\b([a-z][a-z\s]{2,30}?)\s+including\s+([a-z][a-z,\s]{2,60}?)(?:\.|,\s+(?:and|or|etc)|;|$)/gi;
+      while((m=inclPat.exec(s))!==null){
+        const cls=this._clean(m[1]);
+        if(!cls||cls.split(' ').length>4)continue;
+        const members=m[2].split(/,\s*|\s+and\s+|\s+or\s+/).map(e=>this._clean(e)).filter(e=>e&&e.length>1&&e.split(' ').length<=4);
+        for(const mem of members.slice(0,4)){
+          this._addTriple(cls,'includes',mem,0.7,src);
+          this._addTriple(mem,'part-of',cls,0.65,src);
+        }
+      }
+
+      // Pattern: "X is used to/for Y" — explicit purpose
+      const usedPat=/\b([a-z][a-z\s]{1,25}?)\s+(?:is|are|was|were)\s+used\s+(?:to|for)\s+([a-z][a-z\s]{2,35}?)(?:\.|,|;|$)/gi;
+      while((m=usedPat.exec(s))!==null){
+        const subj=this._clean(m[1]),obj=this._clean(m[2].replace(/^(the|a|an)\s+/,''));
+        if(subj&&obj&&obj.split(' ').length<=5)this._addTriple(subj,'used-for',obj,0.8,src);
+      }
+
+      // Pattern: "X refers to Y" / "X is known as Y" / "X is called Y"
+      const refPat=/\b([a-z][a-z\s]{1,25}?)\s+(?:refers to|is known as|is called|is termed|is defined as|is described as)\s+([a-z][a-z\s]{1,35}?)(?:\.|,|;|$)/gi;
+      while((m=refPat.exec(s))!==null){
+        const subj=this._clean(m[1]),obj=this._clean(m[2]);
+        if(subj&&obj&&obj.split(' ').length<=6)this._addTriple(subj,'defined-as',obj,0.85,src);
+      }
+
+      // Pattern: "X consists of/is made of/is composed of Y"
+      const madePat=/\b([a-z][a-z\s]{1,25}?)\s+(?:consists of|is made of|is composed of|is formed from|is built from)\s+([a-z][a-z\s,]{2,50}?)(?:\.|,|;|$)/gi;
+      while((m=madePat.exec(s))!==null){
+        const subj=this._clean(m[1]);
+        const parts=m[2].split(/,\s*|\s+and\s+/).map(e=>this._clean(e)).filter(e=>e&&e.length>1&&e.split(' ').length<=5);
+        for(const part of parts.slice(0,4)){
+          this._addTriple(subj,'has-part',part,0.78,src);
+          this._addTriple(part,'part-of',subj,0.72,src);
+        }
+      }
+
+      // Pattern: "X is a type/kind/form/class/example of Y"
+      const typePat=/\b([a-z][a-z\s]{1,25}?)\s+is\s+a\s+(?:type|kind|form|class|category|example|instance|variant|subtype|subset)\s+of\s+([a-z][a-z\s]{1,35}?)(?:\.|,|;|$)/gi;
+      while((m=typePat.exec(s))!==null){
+        const subj=this._clean(m[1]),obj=this._clean(m[2]);
+        if(subj&&obj&&subj!==obj)this._addTriple(subj,'is-a',obj,0.9,src);
+      }
+
+      // ── NEW PATTERNS: Wikipedia-style constructions ───────────
+
+      // Pattern: "X was/is founded/established in YYYY" — REQUIRES 4-digit year
+      // Guards: subject must be 1-4 words, proper noun (starts uppercase), year must be real
+      const foundedPat=/\b([A-Z][A-Za-z]{1,20}(?:\s+[A-Z][A-Za-z]{1,20}){0,3})\s+(?:was\s+|were\s+)?(?:founded in|established in|created on|formed in|incorporated in|organized on)\s+in\s+(\d{4})\b/g;
+      while((m=foundedPat.exec(s))!==null){
+        const subj=this._clean(m[1]),year=m[2];
+        const y=parseInt(year);
+        // Only store if year is plausible (1000–2100) and subject is short enough
+        if(subj&&subj.split(' ').length<=4&&y>=1000&&y<=2100)
+          this._addTriple(subj,'established',year,0.82,src);
+      }
+
+      // Pattern: "X served as [the] Y [of/in Z]"
+      // "Gandhi served as leader of the independence movement"
+      const servedPat=/\b([A-Z][A-Za-z\s]{1,35}?)\s+served\s+as\s+(?:a|an|the)?\s*([a-z][a-z\s\-]{2,40}?)(?=,|\.|;|\s+of\s+|\s+from\s+|\s+in\s+|\s+between\s+|\s+until\s+|$)/g;
+      while((m=servedPat.exec(s))!==null){
+        const subj=this._clean(m[1]),obj=this._clean(m[2]);
+        if(subj&&obj&&obj.split(' ').length<=5)this._addTriple(subj,'is-a',obj,0.76,src);
+      }
+
+      // Pattern: "X led to Y" / "X resulted in Y" / "X gave rise to Y"
+      // "The famine led to mass migration"
+      const ledToPat=/\b([A-Z]?[A-Za-z][a-z\s]{2,40}?)\s+(?:led to|resulted in|gave rise to|culminated in|ended in)\s+([a-z][a-z\s]{2,35}?)(?:\.|,|;|$)/g;
+      while((m=ledToPat.exec(s))!==null){
+        const subj=this._clean(m[1]),obj=this._clean(m[2]);
+        if(subj&&obj&&subj.split(' ').length<=5&&obj.split(' ').length<=5)
+          this._addTriple(subj,'caused',obj,0.78,src);
+      }
+
+      // Pattern: "X, also known as Y" / "X, formerly known as Y"
+      // "Mumbai, also known as Bombay"
+      const akaPat=/\b([A-Z][A-Za-z\s]{1,35}?),?\s+(?:also|formerly|previously|officially|popularly|commonly)?\s*known as\s+(?:the\s+)?([A-Z]?[a-z][A-Za-z\s\-]{2,40}?)(?=,|\.|;|\(|$)/g;
+      while((m=akaPat.exec(s))!==null){
+        const subj=this._clean(m[1]),obj=this._clean(m[2]);
+        if(subj&&obj&&subj!==obj&&obj.split(' ').length<=5)this._addTriple(subj,'defined-as',obj,0.83,src);
+      }
+
+      // Pattern: "In YYYY, X [verb]ed Y" — historical event sentences
+      // "In 1857, Indian sepoys mutinied against the British"
+      const inYearPat=/\bIn\s+(\d{4}),?\s+([A-Z][A-Za-z\s]{1,35}?)\s+(?:was\s+)?([a-z]{3,15}(?:ed|d|t))\s+([a-z][a-z\s]{2,30}?)(?:\.|,|;|$)/g;
+      while((m=inYearPat.exec(s))!==null){
+        const subj=this._clean(m[2]),verbForm=m[3],obj=this._clean(m[4]);
+        if(subj&&obj&&subj.split(' ').length<=5&&obj.split(' ').length<=5){
+          const stem=verbForm.replace(/(?:ied)$/,'y').replace(/(?:ed|d|t)$/,'');
+          const rel=this._verbToRel(stem);
+          if(rel!=='relates-to')this._addTriple(subj,rel,obj,0.76,src);
+          else this._addTriple(subj,'established',obj,0.7,src);
+        }
+      }
+
+      // Pattern: "X took place in/at Y" — location of event
+      // "The battle took place near Plassey"
+      const tookPlacePat=/\b([A-Z][A-Za-z\s]{1,35}?)\s+took\s+place\s+(?:in|at|near|around)\s+([A-Z]?[A-Za-z\s]{2,30}?)(?:\.|,|;|$)/g;
+      while((m=tookPlacePat.exec(s))!==null){
+        const subj=this._clean(m[1]),obj=this._clean(m[2]);
+        if(subj&&obj&&obj.split(' ').length<=4)this._addTriple(subj,'located-in',obj,0.79,src);
+      }
+
+      // Pattern: "X is/was part of Y"
+      // "Bengal is part of the Indian subcontinent"
+      const partOfPat=/\b([A-Z]?[a-z][A-Za-z\s]{1,30}?)\s+(?:is|was|were|are)\s+(?:a\s+)?part\s+of\s+([A-Z]?[a-z][A-Za-z\s]{1,35}?)(?:\.|,|;|$)/g;
+      while((m=partOfPat.exec(s))!==null){
+        const subj=this._clean(m[1]),obj=this._clean(m[2]);
+        if(subj&&obj&&subj!==obj&&subj.split(' ').length<=5&&obj.split(' ').length<=5)
+          this._addTriple(subj,'part-of',obj,0.81,src);
+      }
+
+      // Pattern: "X was [the] Y of Z [from YYYY]" — role/position
+      // "Dalhousie was the Governor-General of India"
+      const rolePat=/\b([A-Z][A-Za-z\s]{1,30}?)\s+was\s+(?:the\s+)?([a-z][a-z\s\-]{2,35}?)\s+of\s+([A-Z]?[A-Za-z\s]{1,30}?)(?:\s+from\s+|\s+between\s+|\s+until\s+|\.|,|;|$)/g;
+      while((m=rolePat.exec(s))!==null){
+        const subj=this._clean(m[1]),role=this._clean(m[2]),org=this._clean(m[3]);
+        if(subj&&role&&org&&role.split(' ').length<=4&&org.split(' ').length<=4){
+          this._addTriple(subj,'is-a',role,0.78,src);
+          this._addTriple(subj,'governs',org,0.7,src);
+        }
+      }
+
+      // ── EDGE CASE PATTERNS ────────────────────────────────────────
+
+      // Pattern: compound split on "but/however/whereas/while/although"
+      // "X is Y, but Z is W" — extract both clauses independently
+      const butPat=/\b([A-Za-z][A-Za-z\s]{1,30}?)\s+(?:is|was|are|were)\s+([a-z][a-z\s]{2,30}?),?\s+(?:but|however|whereas|while|although|though|yet)\s+([A-Za-z][A-Za-z\s]{1,30}?)\s+(?:is|was|are|were)\s+([a-z][a-z\s]{2,30}?)(?:\.|,|;|$)/g;
+      while((m=butPat.exec(s))!==null){
+        const s1=this._clean(m[1]),o1=this._clean(m[2]);
+        const s2=this._clean(m[3]),o2=this._clean(m[4]);
+        if(s1&&o1&&s1.split(' ').length<=4&&o1.split(' ').length<=5)this._addTriple(s1,'has-property',o1,0.72,src);
+        if(s2&&o2&&s2.split(' ').length<=4&&o2.split(' ').length<=5)this._addTriple(s2,'has-property',o2,0.72,src);
+        if(s1&&s2)this._addTriple(s1,'differs-from',s2,0.65,src);
+      }
+
+      // Pattern: existential "There is/are [a/an/the] X [that/which Y]"
+      // "There is a strong relationship between X and Y"
+      const therePat=/\bThere\s+(?:is|are|was|were)\s+(?:a|an|the|strong|significant|clear|some|no|little|great)?\s*(?:a|an)?\s*([a-z][a-z\s\-]{2,40}?)\s+(?:between|among|across|within|in|of)\s+([a-z][a-z,\s&]{2,50}?)(?:\.|,|;|$)/gi;
+      while((m=therePat.exec(s))!==null){
+        const rel=this._clean(m[1]);
+        const parties=m[2].split(/\s+and\s+|\s+&\s+|,\s*/).map(e=>this._clean(e)).filter(e=>e&&e.length>1&&e.split(' ').length<=4);
+        if(rel&&rel.split(' ').length<=4&&parties.length>=2){
+          for(let pi=0;pi<parties.length-1;pi++){
+            this._addTriple(parties[pi],'connected-to',parties[pi+1],0.68,src);
+            this._addTriple(parties[pi],rel.replace(/\s+/g,'-'),parties[pi+1],0.65,src);
+          }
+        }
+      }
+
+      // Pattern: gerund subject "Using/Developing/Building X [verb]s Y"
+      // "Using machine learning improves accuracy"
+      const gerundPat=/\b(Using|Developing|Building|Creating|Applying|Implementing|Combining|Integrating|Studying|Teaching|Learning)\s+([a-z][a-z\s]{2,30}?)\s+(improves?|increases?|reduces?|enables?|allows?|prevents?|requires?|supports?|enhances?|strengthens?)\s+([a-z][a-z\s]{2,30}?)(?:\.|,|;|$)/g;
+      while((m=gerundPat.exec(s))!==null){
+        const subj=this._clean(m[2]),rel=this._verbToRel(m[3].replace(/s$/,'')),obj=this._clean(m[4]);
+        if(subj&&obj&&rel&&rel!=='relates-to'&&subj.split(' ').length<=5&&obj.split(' ').length<=5)
+          this._addTriple(subj,rel,obj,0.73,src);
+      }
+
+      // Pattern: "X can/could/may/might/must [verb] Y"
+      // "Bacteria can develop resistance to antibiotics"
+      const modalPat=/\b([A-Z]?[a-z][A-Za-z\s]{1,30}?)\s+(?:can|could|may|might|must|should|will)\s+([a-z]{3,15})\s+([a-z][a-z\s]{2,30}?)(?:\.|,|;|\s+and\s+|$)/g;
+      while((m=modalPat.exec(s))!==null){
+        const subj=this._clean(m[1]),verbF=m[2],obj=this._clean(m[3]);
+        const rel=this._verbToRel(verbF);
+        if(subj&&obj&&rel&&rel!=='relates-to'&&subj.split(' ').length<=4&&obj.split(' ').length<=5)
+          this._addTriple(subj,rel,obj,0.69,src);
+      }
+
+      // Pattern: "X and Y [both/together/jointly] [verb] Z"
+      // "France and Germany signed the agreement"
+      const jointPat=/\b([A-Z][A-Za-z\s]{1,25}?)\s+and\s+([A-Z][A-Za-z\s]{1,25}?)\s+(?:both\s+|together\s+|jointly\s+)?([a-z]{3,15}(?:ed|d|t)?)\s+([a-z][a-z\s]{2,30}?)(?:\.|,|;|$)/g;
+      while((m=jointPat.exec(s))!==null){
+        const s1=this._clean(m[1]),s2=this._clean(m[2]),verbF=m[3],obj=this._clean(m[4]);
+        const rel=this._verbToRel(verbF.replace(/(?:ed|d|t)$/,''));
+        if(s1&&s2&&obj&&rel&&rel!=='relates-to'&&s1.split(' ').length<=3&&obj.split(' ').length<=4){
+          this._addTriple(s1,rel,obj,0.71,src);
+          this._addTriple(s2,rel,obj,0.71,src);
+          this._addTriple(s1,'interacts-with',s2,0.65,src);
+        }
+      }
+
+      // Pattern: percentage/quantitative "X [makes up / accounts for / represents] N% of Y"
+      // "Oxygen makes up 21% of the atmosphere"
+      const pctPat=/\b([A-Za-z][a-z\s]{1,25}?)\s+(?:makes up|accounts? for|represents?|comprises?|constitutes?|forms?)\s+(\d[\d\.]*\s*%)\s+of\s+([a-z][a-z\s]{2,30}?)(?:\.|,|;|$)/gi;
+      while((m=pctPat.exec(s))!==null){
+        const subj=this._clean(m[1]),pct=m[2].trim(),obj=this._clean(m[3]);
+        if(subj&&obj&&subj.split(' ').length<=4&&obj.split(' ').length<=4){
+          this._addTriple(subj,'part-of',obj,0.8,src);
+          this._addTriple(subj,'measures',pct,0.7,src);
+        }
+      }
+
+      // Pattern: "X [verb]ed for [N years/decades/centuries]"
+      // "The Roman Empire lasted for five centuries"
+      const durationPat=/\b([A-Z][A-Za-z\s]{1,35}?)\s+(?:lasted|existed|survived|continued|persisted|endured|spanned|ran)\s+(?:for\s+)?(\d+|[a-z]+)\s+(years?|decades?|centuries|century|months?|weeks?)(?:\.|,|;|$)/g;
+      while((m=durationPat.exec(s))!==null){
+        const subj=this._clean(m[1]),dur=m[2]+' '+m[3];
+        if(subj&&subj.split(' ').length<=5)this._addTriple(subj,'measures',dur,0.72,src);
+      }
+
+      // Pattern: parenthetical redefinition "(also called/known as X)" / "(or X)"
+      // immediately after a concept term in the same sentence
+      const parenPat=/\b([A-Za-z][a-z\s]{1,25}?)\s*\((?:also\s+)?(?:called|known as|or|i\.e\.?,?|e\.g\.?,?|viz\.?)?\s*([A-Za-z][A-Za-z\s\-]{2,35}?)\)/g;
+      while((m=parenPat.exec(s))!==null){
+        const subj=this._clean(m[1]),alias=this._clean(m[2]);
+        if(subj&&alias&&subj!==alias&&alias.split(' ').length<=5)this._addTriple(subj,'defined-as',alias,0.8,src);
+      }
+
+      // Pattern: "X [verb]ed [from/between] YYYY [to/and/until] YYYY"
+      // "The war lasted from 1914 to 1918"
+      const yearRangePat=/\b([A-Z][A-Za-z\s]{1,35}?)\s+(?:lasted|spanned|ran|occurred|took place|happened|existed|continued)\s+(?:from\s+)?(\d{4})\s+(?:to|until|and|–|-)\s+(\d{4})\b/g;
+      while((m=yearRangePat.exec(s))!==null){
+        const subj=this._clean(m[1]),y1=m[2],y2=m[3];
+        if(subj&&subj.split(' ').length<=5){
+          this._addTriple(subj,'measures',`${y1}–${y2}`,0.75,src);
+          this._addTriple(subj,'established',y1,0.7,src);
+          this._addTriple(subj,'ended',y2,0.7,src);
+        }
+      }
+
+      // Pattern: "X was governed/controlled/ruled/administered by Y"
+      // "India was governed by the British East India Company"
+      const governedByPat=/\b([A-Z][A-Za-z\s]{1,30}?)\s+(?:was|were)\s+(?:governed|controlled|ruled|administered|managed|occupied|colonized|dominated)\s+by\s+(?:the\s+)?([A-Z]?[A-Za-z\s]{1,35}?)(?:\.|,|;|$)/g;
+      while((m=governedByPat.exec(s))!==null){
+        const subj=this._clean(m[1]),obj=this._clean(m[2]);
+        if(subj&&obj&&subj.split(' ').length<=5&&obj.split(' ').length<=5){
+          this._addTriple(obj,'governed',subj,0.82,src);
+          this._addTriple(subj,'part-of',obj,0.65,src);
+        }
+      }
+
+      // Pattern: "X [verb]ed/opposed/supported Y's [rule/control/policy]"
+      // "Sepoys opposed the Company's policies"
+      const opposedPat=/\b([A-Z][A-Za-z\s]{1,30}?)\s+(opposed|resisted|fought|challenged|rejected|supported|backed|joined|led|defeated)\s+(?:the\s+)?([A-Z]?[A-Za-z\s]{1,30}?)(?:'s\s+[a-z]+)?(?:\.|,|;|$)/g;
+      while((m=opposedPat.exec(s))!==null){
+        const subj=this._clean(m[1]),verbRaw=m[2].toLowerCase(),obj=this._clean(m[3]);
+        if(subj&&obj&&subj.split(' ').length<=5&&obj.split(' ').length<=4){
+          const rel=this._verbToRel(verbRaw.replace(/(?:ed|d)$/,''));
+          if(rel&&rel!=='relates-to')this._addTriple(subj,rel,obj,0.75,src);
+        }
+      }
+    }  // end for sentRaw
+    if(this._simDirty){this.adjTracker.buildSim();this._simDirty=false;}
+  }
+
+  // Map verb lemma → semantic relation label
+  // Ordered from most-specific to most-general to avoid early-exit mismatches.
+  _verbToRel(v){
+    // ── Containment / membership ──────────────────────────────────────
+    if(/^(include|contain|compris|consist|encompass|incorporat|subsum|embed)/.test(v))return'includes';
+    if(/^(belong|classif|categor|group|cluster|fell under)/.test(v))return'member-of';
+    // ── Authority / control ───────────────────────────────────────────
+    if(/^(lead|control|govern|rule|manag|administr|direct|oversee|supervis|command|head)/.test(v))return'governs';
+    if(/^(own|possess|hold|retain|carry|acquir|purchas|buy)/.test(v))return'has';
+    // ── Succession / replacement ──────────────────────────────────────
+    if(/^(succeed|follow|replac|supercede|supersed|inherit|tak over)/.test(v))return'succeeded';
+    if(/^(preced|predat|antedat|come before|came before)/.test(v))return'preceded';
+    // ── Creation / origin ─────────────────────────────────────────────
+    if(/^(found|establish|creat|build|form|start|begin|initiat|launch|invent|develop|design|construct|introduc|pioneer|originat)/.test(v))return'established';
+    if(/^(deriv|originat|stem|aris|emerg|evolv|grow|develop from|came from)/.test(v))return'derived-from';
+    if(/^(produc|manufactur|generat|yield|output|synthesiz|assembl|fabricat|mak|made)/.test(v))return'produces';
+    // ── Termination / change ──────────────────────────────────────────
+    if(/^(end|finish|conclud|terminat|abolish|dissolv|eliminat|destroy|remov|ceas|stop|halt)/.test(v))return'ended';
+    if(/^(chang|transform|convert|alter|modif|shift|transit|evolv|becom|turn)/.test(v))return'transforms-into';
+    if(/^(reduc|decreas|lower|diminish|shrink|declin|drop|fall|wane)/.test(v))return'reduces';
+    if(/^(increas|grow|rise|expand|enlarg|extend|amplif|boost|acceler)/.test(v))return'increases';
+    // ── Description / definition ──────────────────────────────────────
+    if(/^(describ|explain|defin|represent|denot|signif|characteriz|portray|depict|illustrat)/.test(v))return'describes';
+    if(/^(call|name|term|label|know|refer|titl|entitl|dub)/.test(v))return'called';
+    if(/^(mean|signif|impl|indicat|suggest|denot|stand for|symbol)/.test(v))return'means';
+    if(/^(classif|categ|sort|rank|order|arrang|organiz|group)/.test(v))return'classified-as';
+    // ── Causation / enablement ────────────────────────────────────────
+    if(/^(caus|produc|result in|lead|bring|trigger|generat|induc|provok|spark|creat|forc|driv)/.test(v))return'causes';
+    if(/^(enabl|allow|permit|facilitat|support|empower|help|assist|aid)/.test(v))return'enables';
+    if(/^(prevent|block|inhibit|suppress|restrict|limit|hinder|impede|obstruct)/.test(v))return'prevents';
+    if(/^(requir|need|demand|depend|rel on|necessitat)/.test(v))return'requires';
+    // ── Spatial / scope ───────────────────────────────────────────────
+    if(/^(extend|span|stretch|cover|reach|cross|run through)/.test(v))return'extends-over';
+    if(/^(locat|situat|plac|position|reside|live|found in|base)/.test(v))return'located-in';
+    // ── Interaction / influence ───────────────────────────────────────
+    if(/^(affect|impact|influenc|shape|determin|alter|modif|change|impact)/.test(v))return'affects';
+    if(/^(support|promot|enhanc|improv|strengthen|boost|reinforce|favour|favor)/.test(v))return'supports';
+    if(/^(oppos|contradict|conflict|counter|refut|challeng|dispute|reject)/.test(v))return'opposes';
+    if(/^(compar|contrast|differ|distinguish|separat|vary)/.test(v))return'differs-from';
+    if(/^(connect|link|relat|associat|tie|join|coupl|bind)/.test(v))return'connected-to';
+    if(/^(interact|communicat|exchang|collaborat|cooper|work with)/.test(v))return'interacts-with';
+    // ── Representation / communication ───────────────────────────────
+    if(/^(show|reveal|demonstrat|indicat|exhibit|display|present|manifest)/.test(v))return'shows';
+    if(/^(measur|quantif|calculat|comput|estimat|assess|evaluat)/.test(v))return'measures';
+    if(/^(study|research|investigat|analyz|examin|explor|test|experiment)/.test(v))return'studies';
+    if(/^(apply|use|employ|utiliz|implement|deploy|adopt|operat)/.test(v))return'used-for';
+    // ── Knowledge / belief ───────────────────────────────────────────
+    if(/^(know|understand|learn|recogniz|perceiv|observ|notic|realiz)/.test(v))return'knows';
+    if(/^(believ|think|consider|assum|expect|hypothesiz|theori)/.test(v))return'believes';
+    // ── Gain / lose ───────────────────────────────────────────────────
+    if(/^(gain|acquir|obtain|receiv|earn|win|secur|attain|achiev|accumulat)/.test(v))return'has';
+    if(/^(lose|lost|shed|relinquish|surrender|abandon|giv up|drop|reduct)/.test(v))return'reduces';
+    // ── Movement / spread ─────────────────────────────────────────────
+    if(/^(spread|propagat|diffus|disseminat|transmit|send|carry|transfer|mov|migrat|travel)/.test(v))return'affects';
+    if(/^(enter|join|arriv|reach|approach|penetrat|invad)/.test(v))return'connected-to';
+    if(/^(leav|exit|depart|withdraw|reced|retreat|escap)/.test(v))return'differs-from';
+    // ── Usage / consumption ───────────────────────────────────────────
+    if(/^(consum|eat|drink|absorb|digest|metabolis|break down|decompos)/.test(v))return'used-for';
+    // ── Comparison ────────────────────────────────────────────────────
+    if(/^(equal|match|resembl|mirror|parallel|reflect|correspond|align)/.test(v))return'connected-to';
+    if(/^(exceed|surpass|outperform|overcom|beat|top|outrank)/.test(v))return'differs-from';
+    return'relates-to';
+  }
+
+  // ── Concept expansion (graph walk) ────────────────────────────
+  expand(concept,hops=2){
+    const visited=new Set([concept]);
+    let frontier=new Set([concept]);
+    for(let h=0;h<hops;h++){
+      const next=new Set();
+      for(const f of frontier)if(this.conceptIdx[f])for(const n of this.conceptIdx[f])if(!visited.has(n)){visited.add(n);next.add(n);}
+      frontier=next;if(!frontier.size)break;
+    }
+    return visited;
+  }
+
+  // ── Multi-level inference pass ────────────────────────────────
+  // Level 1 — Transitivity: A→B, B→C ⟹ A→C (for is-a, part-of, located-in)
+  // Level 2 — Symmetry: A connected-to B ⟹ B connected-to A
+  // Level 3 — Inheritance: if A is-a B and B has-property P ⟹ A has-property P
+  // Level 4 — Causal chain: A causes B, B causes C ⟹ A indirectly-causes C
+  // Level 5 — Concept grouping: merge subjects that share the same canon stem
+  //            and have overlapping relation sets — promotes "californio" / "californios"
+  //            / "california" into a shared parent node
+  // Called once after batch learn() calls; not on every triple insertion (too slow).
+  inferPass(){
+    const MAX_INFER=120; // cap so we don't explode on large graphs
+    let added=0;
+
+    // ── Level 1: Transitive closure for hierarchical relations ──
+    const TRANSITIVE=new Set(['is-a','part-of','located-in','member-of','classified-under','derived-from']);
+    for(const rel of TRANSITIVE){
+      const bySubj={};
+      for(const t of this.triples)if(t.rel===rel&&t.conf>=0.55){
+        if(!bySubj[t.subj])bySubj[t.subj]=[];
+        bySubj[t.subj].push(t.obj);
+      }
+      for(const [a,bs] of Object.entries(bySubj)){
+        for(const b of bs){
+          const cs=bySubj[b]||[];
+          for(const c of cs){
+            if(c!==a&&added<MAX_INFER){
+              const already=this.triples.find(t=>t.subj===a&&t.rel===rel&&t.obj===c);
+              if(!already){this._addTriple(a,rel,c,0.52,'infer:transitive');added++;}
+            }
+          }
+        }
+      }
+    }
+
+    // ── Level 2: Symmetric relation inference ───────────────────
+    const SYMMETRIC=['connected-to','interacts-with','associated-with','differs-from'];
+    for(const rel of SYMMETRIC){
+      const relevant=this.triples.filter(t=>t.rel===rel&&t.conf>=0.6);
+      for(const t of relevant){
+        if(added>=MAX_INFER)break;
+        const rev=this.triples.find(x=>x.subj===t.obj&&x.rel===rel&&x.obj===t.subj);
+        if(!rev){this._addTriple(t.obj,rel,t.subj,t.conf*0.9,'infer:symmetric');added++;}
+      }
+    }
+
+    // ── Level 3: Property inheritance via is-a ───────────────────
+    // If A is-a B, and B has-property P, then A has-property P (reduced confidence)
+    const isA=this.triples.filter(t=>t.rel==='is-a'&&t.conf>=0.65);
+    const hasProp=this.triples.filter(t=>t.rel==='has-property'&&t.conf>=0.65);
+    for(const ia of isA){
+      const parentProps=hasProp.filter(p=>p.subj===ia.obj);
+      for(const pp of parentProps){
+        if(added>=MAX_INFER)break;
+        const already=this.triples.find(t=>t.subj===ia.subj&&t.rel==='has-property'&&t.obj===pp.obj);
+        if(!already){this._addTriple(ia.subj,'has-property',pp.obj,Math.min(ia.conf,pp.conf)*0.75,'infer:inherit');added++;}
+      }
+    }
+
+    // ── Level 4: Causal chains ─────────────────────────────────
+    const causes=this.triples.filter(t=>t.rel==='causes'&&t.conf>=0.6);
+    const causeMap={};
+    for(const t of causes){if(!causeMap[t.subj])causeMap[t.subj]=[];causeMap[t.subj].push(t.obj);}
+    for(const [a,bs] of Object.entries(causeMap)){
+      for(const b of bs){
+        for(const c of (causeMap[b]||[])){
+          if(c!==a&&added<MAX_INFER){
+            const already=this.triples.find(t=>t.subj===a&&t.obj===c&&(t.rel==='causes'||t.rel==='indirectly-causes'));
+            if(!already){this._addTriple(a,'indirectly-causes',c,0.5,'infer:causal-chain');added++;}
+          }
+        }
+      }
+    }
+
+    // ── Level 5: Concept co-referencing — group genuine near-duplicates ──
+    // Requirements for a same-as link:
+    //   (a) canon forms match (stem-level)
+    //   (b) concepts share ≥ 1 relation object in common (relational coherence)
+    //   (c) longer form starts with the shorter form (true substring / inflection variant)
+    //   (d) NOT just a 1-character difference in a long phrase (e.g. "settle" vs "settlement")
+    const concepts=Object.keys(this.conceptIdx);
+    const canonGroups={};
+    for(const c of concepts){
+      const k=this._canon(c);
+      if(!canonGroups[k])canonGroups[k]=[];
+      canonGroups[k].push(c);
+    }
+    for(const [,group] of Object.entries(canonGroups)){
+      if(group.length<2)continue;
+      group.sort((a,b)=>a.length-b.length);
+      const canonical=group[0];
+      for(const variant of group.slice(1)){
+        if(added>=MAX_INFER)break;
+        if(variant===canonical)continue;
+        // (c) longer must start with shorter — genuine inflection, not coincidental stem
+        const shorter=canonical.length<=variant.length?canonical:variant;
+        const longer=canonical.length<=variant.length?variant:canonical;
+        if(!longer.startsWith(shorter.slice(0,Math.max(4,shorter.length-1))))continue;
+        // (d) reject if the length difference is > 4 chars (e.g. "settle" vs "settlement" = 4 — allow; "fish" vs "fishing" = 3 — allow; "troop" vs "troops" = 1 — allow)
+        if(longer.length-shorter.length>4)continue;
+        // (b) require shared relational neighbour
+        const nbrCanon=this.conceptIdx[canonical]||new Set();
+        const nbrVariant=this.conceptIdx[variant]||new Set();
+        const sharedNbr=[...nbrCanon].filter(n=>nbrVariant.has(n));
+        if(sharedNbr.length===0)continue;
+        // Emit same-as only if not already present
+        const already=this.triples.find(t=>t.subj===variant&&t.rel==='same-as'&&t.obj===canonical);
+        if(!already){
+          this._addTriple(variant,'same-as',canonical,0.7,'infer:coref');
+          this._addTriple(canonical,'same-as',variant,0.7,'infer:coref');
+          added+=2;
+        }
+      }
+    }
+
+    return added;
+  }
+
+  // ── Curated fact set for display ─────────────────────────────
+  // Produces a scored, deduplicated, filtered list of facts for a query.
+  // Runs the multi-level inference pass first, then:
+  //   1. Filters by confidence ≥ 0.55 and removes noise relations
+  //   2. Groups by (subject-canon, relation-family) so "californio/californios/california"
+  //      merge into one entry per relation type
+  //   3. Scores each group by: avg-conf × coverage × relation-priority
+  //   4. Returns top N groups ranked by score
+  curatedFacts(queryText,n=12){
+    this.inferPass();
+    const cluster=this.queryCluster(queryText);
+    const qWords=new Set(queryText.toLowerCase().split(/\s+/).filter(w=>w.length>2));
+
+    const SKIP=new Set(['acted-on','relates-to','same-as','indirectly-causes','knows','believes','shows','means','called']);
+    const REL_PRIORITY={
+      'is-a':10,'defined-as':10,'has-property':9,'part-of':8,'has-part':8,
+      'located-in':8,'established':7,'governs':7,'causes':7,'enables':7,
+      'used-for':7,'derived-from':6,'origin-of':6,'requires':6,'includes':6,
+      'produces':5,'affects':5,'supports':5,'opposes':5,'ended':5,
+      'succeeded':5,'preceded':5,'transforms-into':4,'increases':4,'reduces':4,
+      'connected-to':3,'interacts-with':3,'associated-with':3,'differs-from':3,
+      'measures':3,'classified-as':4,'classified-under':4,'member-of':4,
+      'created-by':5,'describes':3,'concerns':3,
+    };
+
+    // Collect relevant triples — deduplicate symmetric pairs first
+    // so "A connected-to B" + "B connected-to A" don't both show up
+    const SYMMETRIC_RELS=new Set(['connected-to','interacts-with','associated-with','differs-from']);
+    const seenSymm=new Set();
+    const relevant=this.triples.filter(t=>{
+      if(t.conf<0.55)return false;
+      if(SKIP.has(t.rel))return false;
+      if(this._isNoisy(t.subj)||this._isNoisy(t.obj))return false;
+      // Suppress the reverse direction of symmetric relations
+      if(SYMMETRIC_RELS.has(t.rel)){
+        const key=[t.subj,t.obj].sort().join('↔')+':'+t.rel;
+        if(seenSymm.has(key))return false;
+        seenSymm.add(key);
+      }
+      // Must touch the query cluster or query words
+      const subjMatch=cluster.has(t.subj)||qWords.has(t.subj)||[...qWords].some(w=>t.subj.includes(w)||w.includes(t.subj.split(' ')[0]));
+      const objMatch=cluster.has(t.obj)||qWords.has(t.obj);
+      return subjMatch||objMatch;
+    });
+
+    // Group by (canon-subject, relation-family)
+    // relation family: group 'is-a'+'defined-as'+'classified-as' together etc.
+    const REL_FAMILY={
+      'is-a':'identity','defined-as':'identity','classified-as':'identity','classified-under':'identity','member-of':'identity',
+      'has-property':'property','has-part':'structure','part-of':'structure','includes':'structure',
+      'located-in':'location','origin-of':'location','derived-from':'origin',
+      'established':'event','ended':'event','succeeded':'event','preceded':'event',
+      'causes':'causal','caused-by':'causal','enables':'causal','prevents':'causal','requires':'causal','indirectly-causes':'causal',
+      'governs':'authority','created-by':'authority','used-for':'purpose','produces':'output',
+      'affects':'relation','supports':'relation','opposes':'relation','connected-to':'relation',
+      'associated-with':'relation','differs-from':'relation','interacts-with':'relation',
+      'transforms-into':'change','increases':'change','reduces':'change',
+      'measures':'metric','describes':'description','concerns':'description',
+    };
+
+    const groups={};
+    for(const t of relevant){
+      const cs=this._canon(t.subj);
+      const fam=REL_FAMILY[t.rel]||'other';
+      const key=`${cs}::${fam}`;
+      if(!groups[key])groups[key]={canon:cs,subjects:new Set(),rel:t.rel,family:fam,objects:new Map(),totalConf:0,count:0,src:t.src};
+      groups[key].subjects.add(t.subj);
+      // Merge objects — if same canon object already present, pick higher-conf triple
+      const co=this._canon(t.obj);
+      const existing=groups[key].objects.get(co);
+      if(!existing||t.conf>existing.conf)groups[key].objects.set(co,{text:t.obj,conf:t.conf,rel:t.rel});
+      groups[key].totalConf+=t.conf;
+      groups[key].count++;
+    }
+
+    // Score and sort groups
+    const scored=Object.values(groups).map(g=>{
+      const avgConf=g.totalConf/g.count;
+      const prio=REL_PRIORITY[g.rel]||2;
+      // Prefer groups with multiple confirming triples (coverage)
+      const coverageBonus=Math.log1p(g.count)*0.3;
+      // Prefer groups whose subject directly matches query words
+      const directMatch=[...g.subjects].some(s=>qWords.has(s)||[...qWords].some(w=>s===w))?1.2:1;
+      return{...g,score:avgConf*prio*directMatch+coverageBonus,avgConf};
+    }).sort((a,b)=>b.score-a.score).slice(0,n);
+
+    return scored;
+  }
+
+  // ── Topic cluster from query ──────────────────────────────────
+  // Generates a rich concept cluster from a query by:
+  //   1. Exact concept-graph matches + 2-hop expansion
+  //   2. Morphological / stem variants (plurals, -ing/-ed/-er suffixes)
+  //   3. Partial/substring concept matching with 1-hop expansion
+  //   4. Topic-word co-occurrence index
+  //   5. Upward IS-A hierarchy walk (get the class, then siblings)
+  queryCluster(queryText){
+    const words=this.tagger.tag(queryText)
+    .filter(t=>/^(NN|NNP|JJ|VB)/.test(t.pos)&&t.w.length>2&&!SW.has(t.w))
+    .map(t=>t.lemma||t.w);
+
+    // Generate morphological + synonym variants of a word
+    const variants=(w)=>{
+      const vs=new Set([w]);
+      const stem=NLPStemmer.stemWord(w);
+      if(stem&&stem.length>2&&stem!==w)vs.add(stem);
+      // Morphological inflections
+      for(const base of[w,stem]){
+        if(!base||base.length<3)continue;
+        vs.add(base+'s');vs.add(base+'es');vs.add(base+'ing');vs.add(base+'ed');
+        vs.add(base+'ion');vs.add(base+'tion');vs.add(base+'er');vs.add(base+'ness');
+        vs.add(base+'al');vs.add(base+'ity');vs.add(base+'ment');
+        if(!/e$/.test(base)){vs.add(base+'e');vs.add(base+'es');vs.add(base+'ed');}
+      }
+      // Synonym expansion via SynonymLexicon
+      if(typeof SynonymLexicon!=='undefined'){
+        for(const syn of SynonymLexicon.expandWord(w))vs.add(syn);
+        if(stem)for(const syn of SynonymLexicon.expandWord(stem))vs.add(syn);
+      }
+      return vs;
+    };
+
+    const cluster=new Set();
+    const allConcepts=Object.keys(this.conceptIdx);
+
+    for(const w of words){
+      const wVariants=variants(w);
+
+      // 1. Exact concept match + 2-hop graph expansion
+      for(const v of wVariants){
+        if(this.conceptIdx[v]){cluster.add(v);for(const n of this.expand(v,2))cluster.add(n);}
+      }
+
+      // 2. Substring / prefix / contains concept matching
+      for(const c of allConcepts){
+        if(c.length>40)continue;
+        const cWords=c.split(' ');
+        const cHead=cWords[0];
+        const matches=cWords.some(cw=>wVariants.has(cw))
+        || [...wVariants].some(v=>c.startsWith(v)||c.includes(' '+v))
+        || wVariants.has(cHead);
+        if(matches&&c!==w){cluster.add(c);for(const n of this.expand(c,1))cluster.add(n);}
+      }
+
+      // 3. Topic-word co-occurrence index
+      for(const v of wVariants){
+        if(this.topicWords[v])for(const topic of this.topicWords[v])cluster.add(topic);
+      }
+    }
+
+    // 4. Upward IS-A hierarchy: for every concept in cluster, find its IS-A parents
+    //    and add siblings (other things that share the same IS-A parent)
+    const base=[...cluster];
+    for(const c of base){
+      const parents=this.triples.filter(t=>t.subj===c&&t.rel==='is-a').map(t=>t.obj);
+      for(const parent of parents){
+        cluster.add(parent);
+        const siblings=this.triples.filter(t=>t.rel==='is-a'&&t.obj===parent).map(t=>t.subj);
+        for(const sib of siblings.slice(0,6))cluster.add(sib);
+      }
+      const parts=this.triples.filter(t=>(t.subj===c&&t.rel==='has-part')||(t.obj===c&&t.rel==='part-of')).map(t=>t.subj===c?t.obj:t.subj);
+      for(const part of parts.slice(0,4))cluster.add(part);
+    }
+
+    return cluster;
+  }
+
+  // ── Sentence–cluster coherence score ─────────────────────────
+  // Scores how well a sentence's content words overlap with the concept cluster.
+  // Uses both exact lemma matching and a lightweight suffix-stripping fallback
+  // so inflected forms ("computing" matches "compute") still contribute.
+  sentenceClusterScore(sentText,cluster){
+    if(!cluster.size)return 0.5;
+    const tokens=this.tagger.tag(sentText);
+    const content=tokens.filter(t=>/^(NN|NNP|JJ|VB)/.test(t.pos)&&!SW.has(t.w));
+    if(!content.length)return 0;
+    // Build a set of matching forms for each content word using NLPStemmer
+    let overlap=0;
+    for(const t of content){
+      const forms=new Set([t.w,t.lemma||t.w,NLPStemmer.stemWord(t.w),NLPStemmer.stemWord(t.lemma||t.w)]);
+      for(const f of forms){if(cluster.has(f)){overlap++;break;}}
+    }
+    return Math.min(1,overlap/Math.max(1,content.length));
+  }
+
+  // ── Relation synonym families ─────────────────────────────────────
+  // Maps a canonical rel to a list of natural-language synonyms.
+  // generateIntro picks the surfaceVerb from the triple if it fits
+  // the family, otherwise falls back to the canonical template.
+  static REL_SYNONYMS={
+    'governs':       ['rules','controls','administers','leads','oversees','manages','directs','heads'],
+    'is-a':          ['is','was','remains','constitutes','represents','serves as','acts as'],
+    'has-property':  ['is','was','appears','seems','becomes','remains','looks'],
+    'located-in':    ['is in','was in','sits in','lies in','resides in','stands in','occupies'],
+    'established':   ['founded','established','created','formed','built','launched','set up','started'],
+    'ended':         ['ended','abolished','dissolved','terminated','concluded','ceased','stopped'],
+    'causes':        ['causes','triggers','produces','leads to','results in','brings about','creates'],
+    'enables':       ['enables','allows','permits','facilitates','supports','empowers','helps'],
+    'prevents':      ['prevents','blocks','inhibits','stops','restricts','hinders','impedes'],
+    'requires':      ['requires','needs','demands','depends on','relies on','necessitates'],
+    'includes':      ['includes','contains','encompasses','comprises','covers','features'],
+    'part-of':       ['is part of','belongs to','forms part of','constitutes part of'],
+    'has-part':      ['contains','includes','consists of','comprises','is made up of'],
+    'derived-from':  ['derives from','originates from','stems from','emerges from','comes from'],
+    'affects':       ['affects','impacts','influences','shapes','changes','alters','modifies'],
+    'supports':      ['supports','promotes','strengthens','boosts','reinforces','enhances'],
+    'opposes':       ['opposes','contradicts','challenges','counters','disputes','conflicts with'],
+    'produces':      ['produces','generates','yields','creates','manufactures','outputs'],
+    'used-for':      ['is used for','serves','functions as','operates as','acts as'],
+    'succeeded':     ['succeeded','followed','replaced','took over from','came after'],
+    'preceded':      ['preceded','came before','predated','antedated'],
+    'connected-to':  ['is connected to','relates to','links to','associates with','ties to'],
+    'created-by':    ['was created by','was made by','was built by','was founded by','was developed by'],
+    'interacts-with':['interacts with','works with','collaborates with','exchanges with'],
+    'associated-with':['is associated with','is linked to','is tied to','is related to'],
+    'measures':      ['measures','quantifies','calculates','estimates','records','tracks'],
+    'transforms-into':['transforms into','becomes','converts to','turns into','evolves into'],
+    'increases':     ['increases','grows','rises','expands','boosts','raises'],
+    'reduces':       ['reduces','decreases','lowers','shrinks','cuts','diminishes'],
+    'describes':     ['describes','explains','portrays','characterises','depicts','represents'],
+    'concerns':      ['concerns','relates to','is about','addresses','deals with','covers'],
+  };
+
+  // ── Tense-inflect a surface verb or canonical rel label ───────────
+  // Given a relation, a preferred surface verb string, and a tense,
+  // returns the most natural phrasing.
+  _tensedVerb(rel,surfaceVerb,tense){
+    // If the stored surfaceVerb is a real multi-word phrase (e.g. "was ruling"),
+    // and it matches the rel family, use it directly.
+    const synonyms=KnowledgeGraph.REL_SYNONYMS[rel]||[];
+    const sv=(surfaceVerb||'').toLowerCase().trim();
+    // Check if surfaceVerb already contains a synonym for this relation
+    const inFamily=synonyms.some(s=>sv.includes(s.split(' ')[0]));
+    if(inFamily&&sv.length>0&&sv.length<40)return sv;
+
+    // Otherwise, derive from canonical rel + tense
+    const base=synonyms[0]||rel.replace(/-/g,' ');
+    // Inflect the base form for tense
+    switch(tense){
+      case'past':    return this._toPast(base);
+      case'future':  return 'will '+this._toBase(base);
+      case'continuous': return this._toCont(base);
+      default:       return base; // present
+    }
+  }
+
+  _toBase(v){
+    // Extract the core verb from a phrase like "is located in" → "locate"
+    // or "was founded" → "found"
+    const words=v.split(' ').filter(w=>!/^(is|are|was|were|be|been|being|will|would|shall|should|have|has|had|do|does|did|a|an|the|to)$/.test(w));
+    return words[0]||v;
+  }
+  _toPast(v){
+    const b=this._toBase(v);
+    // Simple past inflection rules
+    if(/e$/.test(b))return b+'d';
+    if(/[^aeiou]y$/.test(b))return b.slice(0,-1)+'ied';
+    if(/[^aeiou][aeiou][^aeioulrwhy]$/.test(b))return b+b.slice(-1)+'ed';
+    return b+'ed';
+  }
+  _toCont(v){
+    const b=this._toBase(v);
+    if(/ie$/.test(b))return b.slice(0,-2)+'ying';
+    if(/e$/.test(b)&&!/ee$/.test(b))return b.slice(0,-1)+'ing';
+    return b+'ing';
+  }
+  // Uses curatedFacts() for multi-level inference + noise filtering.
+  // Synthesis intro uses rotating synonym pools per relation type and
+  // merges consecutive same-subject clauses into natural compound sentences
+  // to eliminate monotonous "X is… X is… X is…" repetition.
+  async generateIntro(queryText){
+    const curated=this.curatedFacts(queryText,20);
+    if(!curated.length){
+      const cluster=this.queryCluster(queryText);
+      const knownConcepts=[...cluster].filter(c=>c.length>2&&!SW.has(c)&&c.split(' ').length<=3).slice(0,6);
+      if(knownConcepts.length>=2)return`Related concepts encountered: ${knownConcepts.join(', ')}.`;
+      return null;
+    }
+
+    // Extra display-time guard: filter out any group whose avg confidence is below 0.62
+    // (these are grammatically weak triples that shouldn't appear in prose)
+    const highConf=curated.filter(g=>g.avgConf>=0.62&&!this._isNoisy(g.canon));
+
+    // ── Per-relation synonym pools ─────────────────────────────────────
+    // Each pool entry is a function (subj,obj)→string.
+    // Multiple variants per relation; we cycle through them per-subject
+    // so consecutive sentences about the same subject don't sound identical.
+    const REL_POOL={
+      'is-a':[
+        (s,o)=>`${this._cap(s)} is a ${o}`,
+                                                                                                                                                                        (s,o)=>`${this._cap(s)} constitutes a ${o}`,
+                                                                                                                                                                        (s,o)=>`${this._cap(s)} functions as a ${o}`,
+                                                                                                                                                                        (s,o)=>`${this._cap(s)} represents a form of ${o}`,
+      ],
+      'defined-as':[
+        (s,o)=>`${this._cap(s)} is defined as ${o}`,
+                                                                                                                                                                        (s,o)=>`${this._cap(s)} is described as ${o}`,
+                                                                                                                                                                        (s,o)=>`${this._cap(s)} — often referred to as ${o}`,
+                                                                                                                                                                        (s,o)=>`${this._cap(s)}, known as ${o}`,
+      ],
+      'has-property':[
+        (s,o)=>`${this._cap(s)} is ${o}`,
+                                                                                                                                                                        (s,o)=>`${this._cap(s)} is characterised as ${o}`,
+                                                                                                                                                                        (s,o)=>`${this._cap(s)} appears notably ${o}`,
+                                                                                                                                                                        (s,o)=>`${this._cap(s)} is regarded as ${o}`,
+      ],
+      'part-of':[
+        (s,o)=>`${this._cap(s)} is part of ${o}`,
+                                                                                                                                                                        (s,o)=>`${this._cap(s)} belongs to ${o}`,
+                                                                                                                                                                        (s,o)=>`${this._cap(s)} forms a component of ${o}`,
+                                                                                                                                                                        (s,o)=>`${this._cap(s)} falls within ${o}`,
+      ],
+      'has-part':[
+        (s,o)=>`${this._cap(s)} consists of ${o}`,
+                                                                                                                                                                        (s,o)=>`${this._cap(s)} is made up of ${o}`,
+                                                                                                                                                                        (s,o)=>`${this._cap(s)} contains ${o}`,
+                                                                                                                                                                        (s,o)=>`${this._cap(s)} encompasses ${o}`,
+      ],
+      'located-in':[
+        (s,o)=>`${this._cap(s)} is located in ${o}`,
+                                                                                                                                                                        (s,o)=>`${this._cap(s)} sits within ${o}`,
+                                                                                                                                                                        (s,o)=>`${this._cap(s)} can be found in ${o}`,
+                                                                                                                                                                        (s,o)=>`${this._cap(s)} occupies a place in ${o}`,
+      ],
+      'origin-of':[
+        (s,o)=>`${this._cap(s)} originates from ${o}`,
+                                                                                                                                                                        (s,o)=>`${this._cap(s)} traces its roots to ${o}`,
+                                                                                                                                                                        (s,o)=>`${this._cap(s)} emerged from ${o}`,
+      ],
+      'derived-from':[
+        (s,o)=>`${this._cap(s)} is derived from ${o}`,
+                                                                                                                                                                        (s,o)=>`${this._cap(s)} stems from ${o}`,
+                                                                                                                                                                        (s,o)=>`${this._cap(s)} has its origins in ${o}`,
+      ],
+      'established':[
+        (s,o)=>`${this._cap(s)} was established in ${o}`,
+                                                                                                                                                                        (s,o)=>`${this._cap(s)} was founded around ${o}`,
+                                                                                                                                                                        (s,o)=>`${this._cap(s)} came into being in ${o}`,
+                                                                                                                                                                        (s,o)=>`${this._cap(s)} dates back to ${o}`,
+      ],
+      'ended':[
+        (s,o)=>`${this._cap(s)} ended in ${o}`,
+                                                                                                                                                                        (s,o)=>`${this._cap(s)} was dissolved by ${o}`,
+                                                                                                                                                                        (s,o)=>`${this._cap(s)} concluded with ${o}`,
+      ],
+      'governs':[
+        (s,o)=>`${this._cap(s)} governs ${o}`,
+                                                                                                                                                                        (s,o)=>`${this._cap(s)} oversees ${o}`,
+                                                                                                                                                                        (s,o)=>`${this._cap(s)} administers ${o}`,
+                                                                                                                                                                        (s,o)=>`${this._cap(s)} exercises authority over ${o}`,
+                                                                                                                                                                        (s,o)=>`${this._cap(s)} holds control of ${o}`,
+      ],
+      'includes':[
+        (s,o)=>`${this._cap(s)} includes ${o}`,
+                                                                                                                                                                        (s,o)=>`${this._cap(s)} covers ${o}`,
+                                                                                                                                                                        (s,o)=>`${this._cap(s)} encompasses ${o}`,
+                                                                                                                                                                        (s,o)=>`${this._cap(s)} incorporates ${o}`,
+      ],
+      'member-of':[
+        (s,o)=>`${this._cap(s)} is a member of ${o}`,
+                                                                                                                                                                        (s,o)=>`${this._cap(s)} belongs to ${o}`,
+      ],
+      'classified-as':[(s,o)=>`${this._cap(s)} is classified as ${o}`,(s,o)=>`${this._cap(s)} falls under the category of ${o}`],
+                                                                                                                                                                        'classified-under':[(s,o)=>`${this._cap(s)} falls under ${o}`,(s,o)=>`${this._cap(s)} is grouped under ${o}`],
+                                                                                                                                                                        'describes':[(s,o)=>`${this._cap(s)} describes ${o}`,(s,o)=>`${this._cap(s)} characterises ${o}`,(s,o)=>`${this._cap(s)} portrays ${o}`],
+                                                                                                                                                                        'used-for':[(s,o)=>`${this._cap(s)} is used for ${o}`,(s,o)=>`${this._cap(s)} serves to ${o}`,(s,o)=>`${this._cap(s)} is deployed for ${o}`,(s,o)=>`${this._cap(s)} functions as a tool for ${o}`],
+                                                                                                                                                                        'called':[(s,o)=>`${this._cap(s)} is also called ${o}`,(s,o)=>`${this._cap(s)} goes by the name ${o}`],
+                                                                                                                                                                        'causes':[
+                                                                                                                                                                          (s,o)=>`${this._cap(s)} causes ${o}`,
+                                                                                                                                                                        (s,o)=>`${this._cap(s)} gives rise to ${o}`,
+                                                                                                                                                                        (s,o)=>`${this._cap(s)} triggers ${o}`,
+                                                                                                                                                                        (s,o)=>`${this._cap(s)} leads to ${o}`,
+                                                                                                                                                                        (s,o)=>`${this._cap(s)} results in ${o}`,
+                                                                                                                                                                        ],
+                                                                                                                                                                        'indirectly-causes':[(s,o)=>`${this._cap(s)} indirectly leads to ${o}`,(s,o)=>`${this._cap(s)} has downstream effects on ${o}`],
+                                                                                                                                                                        'caused-by':[(s,o)=>`${this._cap(s)} is caused by ${o}`,(s,o)=>`${this._cap(s)} arises from ${o}`,(s,o)=>`${this._cap(s)} is a consequence of ${o}`],
+                                                                                                                                                                        'enables':[
+                                                                                                                                                                          (s,o)=>`${this._cap(s)} enables ${o}`,
+                                                                                                                                                                        (s,o)=>`${this._cap(s)} makes possible ${o}`,
+                                                                                                                                                                        (s,o)=>`${this._cap(s)} facilitates ${o}`,
+                                                                                                                                                                        (s,o)=>`${this._cap(s)} allows for ${o}`,
+                                                                                                                                                                        ],
+                                                                                                                                                                        'prevents':[(s,o)=>`${this._cap(s)} prevents ${o}`,(s,o)=>`${this._cap(s)} inhibits ${o}`,(s,o)=>`${this._cap(s)} blocks ${o}`],
+                                                                                                                                                                        'requires':[(s,o)=>`${this._cap(s)} requires ${o}`,(s,o)=>`${this._cap(s)} depends on ${o}`,(s,o)=>`${this._cap(s)} necessitates ${o}`],
+                                                                                                                                                                        'required-for':[(s,o)=>`${this._cap(s)} is required for ${o}`,(s,o)=>`${this._cap(s)} is a prerequisite for ${o}`],
+                                                                                                                                                                        'produces':[
+                                                                                                                                                                          (s,o)=>`${this._cap(s)} produces ${o}`,
+                                                                                                                                                                        (s,o)=>`${this._cap(s)} generates ${o}`,
+                                                                                                                                                                        (s,o)=>`${this._cap(s)} yields ${o}`,
+                                                                                                                                                                        (s,o)=>`${this._cap(s)} outputs ${o}`,
+                                                                                                                                                                        ],
+                                                                                                                                                                        'affects':[(s,o)=>`${this._cap(s)} affects ${o}`,(s,o)=>`${this._cap(s)} influences ${o}`,(s,o)=>`${this._cap(s)} shapes ${o}`,(s,o)=>`${this._cap(s)} has an impact on ${o}`],
+                                                                                                                                                                        'supports':[(s,o)=>`${this._cap(s)} supports ${o}`,(s,o)=>`${this._cap(s)} reinforces ${o}`,(s,o)=>`${this._cap(s)} promotes ${o}`,(s,o)=>`${this._cap(s)} strengthens ${o}`],
+                                                                                                                                                                        'opposes':[(s,o)=>`${this._cap(s)} opposes ${o}`,(s,o)=>`${this._cap(s)} counters ${o}`,(s,o)=>`${this._cap(s)} challenges ${o}`,(s,o)=>`${this._cap(s)} conflicts with ${o}`],
+                                                                                                                                                                        'differs-from':[(s,o)=>`${this._cap(s)} differs from ${o}`,(s,o)=>`${this._cap(s)} stands apart from ${o}`,(s,o)=>`${this._cap(s)} is distinct from ${o}`],
+                                                                                                                                                                        'connected-to':[(s,o)=>`${this._cap(s)} is connected to ${o}`,(s,o)=>`${this._cap(s)} links to ${o}`,(s,o)=>`${this._cap(s)} ties into ${o}`],
+                                                                                                                                                                        'measures':[(s,o)=>`${this._cap(s)} measures ${o}`,(s,o)=>`${this._cap(s)} quantifies ${o}`,(s,o)=>`${this._cap(s)} tracks ${o}`],
+                                                                                                                                                                        'transforms-into':[(s,o)=>`${this._cap(s)} transforms into ${o}`,(s,o)=>`${this._cap(s)} evolves into ${o}`,(s,o)=>`${this._cap(s)} becomes ${o}`],
+                                                                                                                                                                        'increases':[(s,o)=>`${this._cap(s)} increases ${o}`,(s,o)=>`${this._cap(s)} boosts ${o}`,(s,o)=>`${this._cap(s)} drives up ${o}`,(s,o)=>`${this._cap(s)} amplifies ${o}`],
+                                                                                                                                                                        'reduces':[(s,o)=>`${this._cap(s)} reduces ${o}`,(s,o)=>`${this._cap(s)} lowers ${o}`,(s,o)=>`${this._cap(s)} diminishes ${o}`,(s,o)=>`${this._cap(s)} cuts ${o}`],
+                                                                                                                                                                        'succeeded':[(s,o)=>`${this._cap(s)} succeeded ${o}`,(s,o)=>`${this._cap(s)} followed ${o}`,(s,o)=>`${this._cap(s)} took over from ${o}`],
+                                                                                                                                                                        'preceded':[(s,o)=>`${this._cap(s)} preceded ${o}`,(s,o)=>`${this._cap(s)} came before ${o}`,(s,o)=>`${this._cap(s)} predated ${o}`],
+                                                                                                                                                                        'interacts-with':[(s,o)=>`${this._cap(s)} interacts with ${o}`,(s,o)=>`${this._cap(s)} works alongside ${o}`,(s,o)=>`${this._cap(s)} collaborates with ${o}`],
+                                                                                                                                                                        'associated-with':[(s,o)=>`${this._cap(s)} is associated with ${o}`,(s,o)=>`${this._cap(s)} is linked to ${o}`,(s,o)=>`${this._cap(s)} is tied to ${o}`],
+                                                                                                                                                                        'concerns':[(s,o)=>`${this._cap(s)} concerns ${o}`,(s,o)=>`${this._cap(s)} relates to ${o}`,(s,o)=>`${this._cap(s)} is centred around ${o}`],
+                                                                                                                                                                        'created-by':[(s,o)=>`${this._cap(s)} was created by ${o}`,(s,o)=>`${this._cap(s)} was developed by ${o}`,(s,o)=>`${this._cap(s)} was built by ${o}`],
+    };
+
+    // ── Sentence-merging connectors ───────────────────────────────────
+    // When two consecutive clauses share the same subject, merge them
+    // with one of these connectors instead of starting a new sentence.
+    const MERGE_CONNECTORS=[
+      ', and also ', ' — it also ', '; it furthermore ', ', while also ',
+      ', and ', ' and additionally ', '; additionally ', ', in addition ',
+    ];
+    // Contrast mergers for opposing relations (opposes/differs-from/prevents)
+    const CONTRAST_RELS=new Set(['opposes','differs-from','prevents','conflicts-with','caused-by']);
+    const CONTRAST_CONNECTORS=[', though it ', ', yet it ', ', while it ', ', even as it ', '; however, it '];
+
+    // Cycle counter per subject to rotate synonyms
+    const subjCycleMap={};
+    function pickVariant(pool,subj){
+      if(!pool||!pool.length)return null;
+      if(!subjCycleMap[subj])subjCycleMap[subj]=0;
+      const idx=subjCycleMap[subj]%pool.length;
+      subjCycleMap[subj]++;
+      return pool[idx];
+    }
+
+    // Build raw clause list first
+    const clauses=[];const seenClause=new Set();
+    const usedSyns=new Set();
+    for(const g of highConf){
+      const relToUse=g.rel;
+      const pool=REL_POOL[relToUse];if(!pool)continue;
+      const subj=[...g.subjects].sort((a,b)=>a.length-b.length)[0];
+      const objs=[...g.objects.values()].sort((a,b)=>b.conf-a.conf).slice(0,4).map(o=>o.text);
+      if(!objs.length)continue;
+      let tmpl=pickVariant(pool,subj);if(!tmpl)continue;
+
+      // THESAURUS INJECTION
+      if(typeof ThesaurusEngine!=='undefined' && ThesaurusEngine.isLoaded()){
+        let baseVerb = KnowledgeGraph.REL_SYNONYMS[relToUse]?.[0] || relToUse.split('-')[0];
+        // Map canonical relation verbs to better base forms for thesaurus hits
+        const baseMap = {'is':'represent', 'defined':'define', 'called':'name', 'located':'locate', 'associated':'associate', 'part':'form', 'originates':'originate', 'stems':'stem'};
+        if(baseMap[baseVerb]) baseVerb = baseMap[baseVerb];
+
+        const syns = await ThesaurusEngine.synonymsOf(baseVerb);
+        if(syns && syns.length > 0){
+          let validSyns = syns.filter(s=>s.length<15 && !s.includes(' '));
+          if(!validSyns.length) validSyns = syns;
+
+          let chosenSyn = validSyns.find(s=>!usedSyns.has(s)) || validSyns[0];
+          usedSyns.add(chosenSyn);
+          if(usedSyns.size > 20) usedSyns.clear();
+
+          if(relToUse==='is-a' || relToUse==='has-property') {
+            let v3sg = chosenSyn.endsWith('s') ? chosenSyn : (chosenSyn.endsWith('y') ? chosenSyn.slice(0,-1)+'ies' : chosenSyn+'s');
+            tmpl = (s,o) => `${this._cap(s)} ${v3sg} ${o}`;
+          }
+          else if(relToUse==='part-of' || relToUse==='located-in') {
+            let vPast = this._toPast(chosenSyn);
+            tmpl = (s,o) => `${this._cap(s)} is ${vPast} within ${o}`;
+          }
+          else if(relToUse==='called' || relToUse==='defined-as' || relToUse==='classified-as') {
+            let vPast = this._toPast(chosenSyn);
+            tmpl = (s,o) => `${this._cap(s)} is ${vPast} as ${o}`;
+          }
+          else {
+            let v3sg = chosenSyn.endsWith('s') ? chosenSyn : (chosenSyn.endsWith('y') ? chosenSyn.slice(0,-1)+'ies' : chosenSyn+'s');
+            tmpl = (s,o) => `${this._cap(s)} ${v3sg} ${o}`;
+          }
+        }
+      }
+
+      let clause;
+      if(objs.length===1){clause=tmpl(subj,objs[0]);}
+      else{
+        // For multi-object: build "X, Y and Z" list using the template for the first,
+        // then append the rest naturally
+        const listStr=objs.slice(0,-1).join(', ')+' and '+objs[objs.length-1];
+        clause=tmpl(subj,listStr);
+      }
+      const key=clause.toLowerCase().slice(0,60);
+      if(!seenClause.has(key)){seenClause.add(key);clauses.push({subj,rel:relToUse,clause});}
+    }
+
+    // ── Sentence merging pass ─────────────────────────────────────────
+    // Group consecutive clauses by canonical subject.
+    // Up to 2 clauses per sentence; then start a new sentence.
+    const sentences=[];
+    let i=0;
+    while(i<clauses.length){
+      const cur=clauses[i];
+      const subjCanon=this._canon(cur.subj);
+      // Try to merge with the next clause if same subject and slots remain
+      const next=clauses[i+1];
+      if(next&&this._canon(next.subj)===subjCanon){
+        const isContrast=CONTRAST_RELS.has(next.rel);
+        const connectors=isContrast?CONTRAST_CONNECTORS:MERGE_CONNECTORS;
+        // Pick connector that hasn't been used recently — rotate by sentence index
+        const conn=connectors[sentences.length%connectors.length];
+        // Extract the predicate fragment from next.clause (strip the repeated subject)
+        // Strategy: remove the capitalised subject prefix (first N words matching subj)
+        const subjWords=next.subj.split(' ').length;
+        const nextWords=next.clause.split(' ');
+        // Strip leading subject words + capitalisation
+        let predicate=nextWords.slice(subjWords).join(' ');
+        // If stripping gave nothing useful, fall back to full clause lowercased subject
+        if(!predicate||predicate.length<4)predicate=next.clause.replace(new RegExp('^'+this._cap(next.subj)+'\\s*','i'),'');
+        // Lower-case the first letter of the predicate fragment since it follows a connector
+        if(predicate)predicate=predicate[0].toLowerCase()+predicate.slice(1);
+        if(predicate&&predicate.length>4){
+          sentences.push(cur.clause+conn+predicate+'.');
+          i+=2;continue;
+        }
+      }
+      sentences.push(cur.clause+'.');
+      i++;
+    }
+
+    // Adjective co-occurrence note (appended if interesting)
+    const qWords=new Set(queryText.toLowerCase().split(/\s+/).filter(w=>w.length>2));
+    const qAdjs=[...qWords].filter(w=>this.adjTracker.adjMeta[w]);
+    for(const adj of qAdjs.slice(0,1)){
+      const sims=this.adjTracker.similar(adj,3);
+      if(sims.length)sentences.push(`Conceptually, "${adj}" is closely related to "${sims.join('", "')}" — they tend to describe similar things.`);
+    }
+
+    if(!sentences.length)return null;
+    return sentences.slice(0,14).join(' ');
+  }
+
+  stats(){
+    const inferred=this.triples.filter(t=>t.src&&t.src.startsWith('infer:')).length;
+    return{triples:this.triples.length,concepts:Object.keys(this.conceptIdx).length,
+      vocab:Object.keys(this.topicWords).length,adjs:Object.keys(this.adjTracker.adjMeta).length,inferred};
+  }
+
+  // ── Brain JSON export ─────────────────────────────────────────────
+  // Serialises the entire knowledge graph to a portable JSON snapshot.
+  // The result can be saved to disk and reloaded later with importBrain().
+  exportBrain(){
+    return{
+      v:2,
+      ts:new Date().toISOString(),
+                                                                                                                                                                        triples:this.triples,
+                                                                                                                                                                        conceptIdx:Object.fromEntries(Object.entries(this.conceptIdx).map(([k,v])=>[k,[...v]])),
+                                                                                                                                                                        topicWords:Object.fromEntries(Object.entries(this.topicWords).map(([k,v])=>[k,[...v]])),
+                                                                                                                                                                        adjMeta:this.adjTracker.adjMeta,
+                                                                                                                                                                        nounAdj:Object.fromEntries(Object.entries(this.adjTracker.nounAdj).map(([k,v])=>[k,[...v]])),
+    };
+  }
+
+  // ── Brain JSON import ─────────────────────────────────────────────
+  // Merges a previously exported brain snapshot into the live graph.
+  // Existing triples are preserved; duplicates are skipped (with confidence boost).
+  importBrain(obj){
+    if(!obj||obj.v!==2)throw new Error('Incompatible brain snapshot (expected v2)');
+    let added=0,boosted=0;
+    for(const t of(obj.triples||[])){
+      const existing=this.triples.find(x=>x.subj===t.subj&&x.rel===t.rel&&x.obj===t.obj);
+      if(existing){existing.conf=Math.min(1,existing.conf+0.05);boosted++;}
+      else{this.triples.push({...t});
+      if(!this.conceptIdx[t.subj])this.conceptIdx[t.subj]=new Set();
+      if(!this.conceptIdx[t.obj])this.conceptIdx[t.obj]=new Set();
+      this.conceptIdx[t.subj].add(t.obj);this.conceptIdx[t.obj].add(t.subj);
+        added++;
+      }
+    }
+    // Restore conceptIdx Sets from plain arrays (for any concepts not covered by triples)
+    for(const[k,vs] of Object.entries(obj.conceptIdx||{})){
+      if(!this.conceptIdx[k])this.conceptIdx[k]=new Set();
+      for(const v of vs)this.conceptIdx[k].add(v);
+    }
+    // Restore topicWords
+    for(const[k,vs] of Object.entries(obj.topicWords||{})){
+      if(!this.topicWords[k])this.topicWords[k]=new Set();
+      for(const v of vs)this.topicWords[k].add(v);
+    }
+    // Restore adjective metadata
+    for(const[adj,meta] of Object.entries(obj.adjMeta||{})){
+      if(!this.adjTracker.adjMeta[adj])this.adjTracker.adjMeta[adj]={freq:0,contexts:[]};
+      this.adjTracker.adjMeta[adj].freq+=meta.freq||0;
+    }
+    for(const[noun,adjs] of Object.entries(obj.nounAdj||{})){
+      if(!this.adjTracker.nounAdj[noun])this.adjTracker.nounAdj[noun]=new Set();
+      for(const a of adjs)this.adjTracker.nounAdj[noun].add(a);
+    }
+    this.adjTracker.buildSim();
+    return{added,boosted};
+  }
+}
+
+// ── PROXY BRIDGE ───────────────────────────────────────────────────
+(()=>{
+  const e=encodeURIComponent;
+  const PROXIES=[
+    {name:'codetabs',fn:async(url,ms)=>{const r=await Promise.race([fetch(`https://api.codetabs.com/v1/proxy?quest=${e(url)}`),new Promise((_,rj)=>setTimeout(()=>rj(new Error('timeout')),ms))]);if(!r.ok)throw new Error(`codetabs ${r.status}`);const t=await r.text();if(t.length<200)throw new Error('too short');return t;}},
+ {name:'cors.lol',fn:async(url,ms)=>{const r=await Promise.race([fetch(`https://api.cors.lol/?url=${e(url)}`),new Promise((_,rj)=>setTimeout(()=>rj(new Error('timeout')),ms))]);if(!r.ok)throw new Error(`cors.lol ${r.status}`);const t=await r.text();if(t.length<200)throw new Error('too short');return t;}},
+ {name:'allorigins',fn:async(url,ms)=>{const r=await Promise.race([fetch(`https://api.codetabs.com/v1/proxy?quest=${e(url)}`),new Promise((_,rj)=>setTimeout(()=>rj(new Error('timeout')),ms))]);if(!r.ok)throw new Error(`allorigins ${r.status}`);const j=await r.json();if(!j.contents||j.contents.length<200)throw new Error('empty');return j.contents;}},
+ {name:'corsproxy.io',fn:async(url,ms)=>{const r=await Promise.race([fetch(`https://api.codetabs.com/v1/proxy?quest=${e(url)}`),new Promise((_,rj)=>setTimeout(()=>rj(new Error('timeout')),ms))]);if(!r.ok)throw new Error(`corsproxy.io ${r.status}`);const t=await r.text();if(t.length<200)throw new Error('too short');return t;}},
+  ];
+  window.__proxyBridge={fetch:async(url,ms=14000)=>{const log=[];for(const px of PROXIES){try{return await px.fn(url,ms);}catch(err){log.push(`${px.name}: ${err.message}`);}}throw new Error(`All proxies failed — ${log.join(' | ')}`);}}
+})();
+
+// ── INGESTER ───────────────────────────────────────────────────────
+class Ingester{
+  constructor(){this.log=[];this.layer='L3';}
+  _log(m){const ts=new Date().toISOString().slice(11,19);this.log.unshift(`${ts} ${m}`);if(this.log.length>14)this.log.pop();}
+  async tout(url,ms=9000){return Promise.race([fetch(url),new Promise((_,rj)=>setTimeout(()=>rj(new Error(`timeout`)),ms))]);}
+
+  async fetchWiki(q){
+    this._log(`L0: Wiki "${q.slice(0,30)}"`);dot('d-wiki','bz');
+    const e=encodeURIComponent;
+    const sr=await this.tout(`https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=${e(q)}&format=json&origin=*&srlimit=5&srprop=size`,8000);
+    if(!sr.ok)throw new Error(`Wiki ${sr.status}`);
+    const sd=await sr.json();const hits=sd.query?.search||[];
+    if(!hits.length)throw new Error('Wiki: no results');
+    const title=hits[0].title;
+    // Fetch full extract (not just summary) to avoid truncation
+    let text='';
+    try{
+      const er=await this.tout(`https://en.wikipedia.org/w/api.php?action=query&titles=${e(title)}&prop=extracts&explaintext=true&exsectionformat=plain&format=json&origin=*`,9000);
+      if(er.ok){const ed=await er.json();const pg=Object.values(ed.query?.pages||{})[0];if(pg?.extract)text=pg.extract.trim();}
+    }catch(_){}
+    if(text.length<500){
+      try{const rr=await this.tout(`https://en.wikipedia.org/api/rest_v1/page/summary/${e(title)}`,6000);if(rr.ok){const rd=await rr.json();text=(text+' '+rd.extract||'').trim();}}catch(_){}
+    }
+    if(text.length<100)throw new Error('Wiki: too short');
+
+    // Fetch images for the article
+    let images=[];
+    try{
+      const ir=await this.tout(`https://en.wikipedia.org/w/api.php?action=query&titles=${e(title)}&prop=images&format=json&origin=*&imlimit=10`,5000);
+      if(ir.ok){
+        const id=await ir.json();const pg=Object.values(id.query?.pages||{})[0];
+        const imgTitles=(pg?.images||[]).filter(img=>!/(logo|icon|flag|seal|coat|arrow|edit|button|commons|svg)/i.test(img.title)).slice(0,4);
+        for(const img of imgTitles){
+          try{
+            const ui=await this.tout(`https://en.wikipedia.org/w/api.php?action=query&titles=${e(img.title)}&prop=imageinfo&iiprop=url|thumburl|extmetadata&iiurlwidth=400&format=json&origin=*`,4000);
+            if(ui.ok){const ud=await ui.json();const p2=Object.values(ud.query?.pages||{})[0];const info=p2?.imageinfo?.[0];
+            if(info?.thumburl||info?.url){images.push({url:info.thumburl||info.url,caption:(info.extmetadata?.ImageDescription?.value||'').replace(/<[^>]+>/g,'').slice(0,80)||img.title.replace('File:','').replace(/\.[^.]+$/,'')});}}
+          }catch(_){}
+        }
+      }
+    }catch(_){}
+
+    // Fetch related/subtopics from categories
+    let relatedTopics=[];
+    try{
+      const cr=await this.tout(`https://en.wikipedia.org/w/api.php?action=query&titles=${e(title)}&prop=categories&format=json&origin=*&cllimit=10`,4000);
+      if(cr.ok){const cd=await cr.json();const pg=Object.values(cd.query?.pages||{})[0];
+      relatedTopics=(pg?.categories||[]).map(c=>c.title.replace('Category:','')).filter(c=>!/(hidden|wikimedia|articles|pages|cs1|births|deaths|living)/i.test(c)).slice(0,8);}
+    }catch(_){}
+    // Also fetch "see also" links as related
+    let links=[];
+    try{
+      const lr=await this.tout(`https://en.wikipedia.org/w/api.php?action=query&titles=${e(title)}&prop=links&format=json&origin=*&pllimit=15&plnamespace=0`,4000);
+      if(lr.ok){const ld=await lr.json();const pg=Object.values(ld.query?.pages||{})[0];
+      links=(pg?.links||[]).map(l=>l.title).slice(0,10);}
+    }catch(_){}
+
+    dot('d-wiki','on');
+    return{text:text.slice(0,14000),title,layer:'L0',images,relatedTopics:[...relatedTopics,...links].slice(0,10),refUrl:`https://en.wikipedia.org/wiki/${e(title)}`};
+  }
+
+  async fetchDDG(q){
+    this._log(`L1: DDG "${q.slice(0,30)}"`);dot('d-ddg','bz');
+    const e=encodeURIComponent;
+    const r=await this.tout(`https://api.duckduckgo.com/?q=${e(q)}&format=json&no_html=1&skip_disambig=1`,6000);
+    if(!r.ok)throw new Error(`DDG ${r.status}`);
+    const d=await r.json();
+    const parts=[d.AbstractText||d.Abstract||'',d.Definition||'',(d.RelatedTopics||[]).filter(t=>t.Text&&!t.Topics).map(t=>t.Text).slice(0,10).join(' ')].filter(Boolean);
+    const text=parts.join(' ').trim();if(text.length<100)throw new Error('DDG: too short');
+
+    // Extract related topics from DDG
+    const relatedTopics=(d.RelatedTopics||[]).filter(t=>t.Text&&!t.Topics).map(t=>t.FirstURL?.split('/').pop()?.replace(/_/g,' ')||t.Text.split(' - ')[0]).filter(Boolean).slice(0,8);
+    // DDG images
+    let images=[];
+    if(d.Image&&d.Image.length>5&&!/(logo|icon)/i.test(d.Image)){images=[{url:d.Image,caption:d.Heading||q}];}
+
+    dot('d-ddg','on');
+    return{text:text.slice(0,7000),title:d.Heading||q,layer:'L1',images,relatedTopics,refUrl:d.AbstractURL||''};
+  }
+
+  async fetchWebScrape(q,act,sP){
+    this._log(`L2: Scrape "${q.slice(0,30)}"`);dot('d-prx','bz');
+    const e2=encodeURIComponent;
+    const upd=(msg,sub)=>act?.updateStep(sP,'',msg,sub,'live');
+    const fin=(msg,sub,fail)=>act?.finishStep(sP,'',msg,sub,fail);
+    const STOP=new Set(['the','and','for','that','this','with','from','are','was','were','has','have','its','not','but','can','they','their','also','been','into','more','which','will','one','two','three','about','what','when','where','who','how','why']);
+    const qTerms=q.toLowerCase().replace(/[^a-z\s]/g,' ').split(/\s+/).filter(w=>w.length>2&&!STOP.has(w));
+    const proxyFetch=async(url,ms=14000)=>window.__proxyBridge.fetch(url,ms);
+    const parser=new DOMParser();
+    function scoreLink(text){const tl=text.toLowerCase().replace(/[^a-z\s]/g,' ');const words=tl.split(/\s+/);let s=0;for(const qt of qTerms){if(tl.includes(qt))s+=2;for(const w of words)if(w===qt)s+=3;}return s;}
+    function stripNoise(main){if(!main)return;['nav','header','footer','.ad','.sidebar','.related','.toc','#toc','.mw-editsection','#mw-navigation','#mw-head','.navbox','.ambox','.hatnote','script','style','sup'].forEach(sel=>{try{main.querySelectorAll(sel).forEach(n=>n.remove());}catch(_){}});}
+    function grabParas(main){const paras=[];main?.querySelectorAll('p,h2,h3').forEach(el=>{const txt=(el.textContent||'').trim().replace(/\s+/g,' ');if(txt.length>40)paras.push(txt);});return paras.join('\n');}
+    const BRIT_JUNK=/^(The Information Architects maintain|Learn about this topic|our editors|learn more|thank you|read more|see more|all rights reserved|encyclop|britannica|cite this|subscribe|sign in|you may also|external links|this article|feedback|corrections|quiz yourself|test your|verif)/i;
+    function cleanBritParas(main){const paras=[];main?.querySelectorAll('p,h2,h3').forEach(el=>{const txt=(el.textContent||'').trim().replace(/\s+/g,' ');if(txt.length>40&&!BRIT_JUNK.test(txt))paras.push(txt);});return paras.join('\n');}
+    function grabRefs(doc,selectors){const refs=[];selectors.forEach(sel=>{doc.querySelectorAll(sel+' li').forEach(li=>{const txt=(li.textContent||'').trim().replace(/\s+/g,' ');if(txt.length>10&&txt.length<400)refs.push(txt);});});return refs;}
+
+    // Extract subtopics, media thumbnails, and references from col-auto / sidebar containers
+    function grabColAutoData(doc){
+      const subtopics=[];const media=[];const refs=[];
+      const seenSub=new Set();const seenMedia=new Set();
+      // Find the col-auto container (Britannica) or equivalent sidebar
+      const caSelectors=['.col-auto','[class*="col-auto"]','.topic-nav','.article-sidebar','.related-topics','.subtopics','[class*="subtopic"]'];
+      const containers=[];
+      for(const sel of caSelectors){doc.querySelectorAll(sel).forEach(el=>containers.push(el));}
+      // Deduplicate containers (skip nested ones)
+      const uniqueContainers=containers.filter((el,i)=>!containers.some((other,j)=>j!==i&&other.contains(el)));
+      for(const el of uniqueContainers){
+        // --- Subtopic links ---
+        el.querySelectorAll('a[href]').forEach(a=>{
+          const txt=(a.textContent||'').trim().replace(/\s+/g,' ');
+          const href=a.getAttribute('href')||'';
+          // Skip obvious nav/footer links, keep meaningful topic links
+          if(txt.length<2||txt.length>90)return;
+          if(/^(skip|home|log in|sign in|subscribe|feedback|print|cite|share|edit)/i.test(txt))return;
+          if(!seenSub.has(txt)){seenSub.add(txt);subtopics.push({text:txt,href});}
+        });
+        // --- Media images from col-auto sidebar ---
+        el.querySelectorAll('img[src],img[data-src]').forEach(img=>{
+          let src=(img.getAttribute('src')||img.getAttribute('data-src')||'').trim();
+          if(!src||(/(logo|icon|flag|seal|arrow|edit|button|sprite|pixel|tracking|1x1|blank|placeholder)/i.test(src)))return;
+          if(src.startsWith('//'))src='https:'+src;
+            else if(src.startsWith('/'))src='https://www.britannica.com'+src;
+              if(!src.startsWith('http'))return;
+              const alt=(img.getAttribute('alt')||'').trim();
+          if(/^(default image?|default|no image)$/i.test(alt))return;
+          if(seenMedia.has(src))return;seenMedia.add(src);
+          const w=parseInt(img.getAttribute('width')||'0');
+          const h=parseInt(img.getAttribute('height')||'0');
+          if((w&&w<40)||(h&&h<40))return;// skip tiny icons
+          // Detect video thumbnail by parent class or siblings
+          const isVideo=!!(img.closest('[class*="video"],[class*="Video"]')||img.parentElement?.querySelector('[class*="play"],[class*="Play"]'));
+          media.push({url:src,caption:alt.slice(0,100),type:isVideo?'video':'image'});
+        });
+        // --- Reference/citation items in col-auto ---
+        el.querySelectorAll('.reference-list li,.references li,[class*="reference"] li,[class*="citation"] li').forEach(li=>{
+          const txt=(li.textContent||'').trim().replace(/\s+/g,' ');
+          if(txt.length>10&&txt.length<400)refs.push(txt);
+        });
+      }
+      // Also try to find references at doc level if col-auto had none
+      if(refs.length===0){
+        doc.querySelectorAll('.reference-list li,.references li').forEach(li=>{
+          const txt=(li.textContent||'').trim().replace(/\s+/g,' ');
+          if(txt.length>10&&txt.length<400)refs.push(txt);
+        });
+      }
+      return{subtopics:subtopics.slice(0,14),media:media.slice(0,6),refs:refs.slice(0,8)};
+    }
+    // Compat shim — non-Britannica sources just need the subtopics array
+    function grabSubtopics(doc){return grabColAutoData(doc).subtopics;}
+
+    // Extract inline images from article (no logos/icons)
+    function grabInlineImages(doc,sourceHost){
+      const imgs=[];
+      const seen=new Set();
+      const articleEl=doc.querySelector('article,[data-topic-id],#mw-content-text,#content-reset,main')||doc.body;
+      articleEl.querySelectorAll('img[src]').forEach(img=>{
+        let src=img.getAttribute('src')||'';
+        const alt2=(img.getAttribute('alt')||'').trim().toLowerCase();
+        if(alt2==='default image'||alt2==='default'||alt2==='no image')return;
+        if(!src||/(logo|icon|flag|seal|arrow|edit|button|sprite|pixel|tracking|1x1|blank|placeholder)/i.test(src))return;
+        if(src.startsWith('//'))src='https:'+src;
+          else if(src.startsWith('/'))src=sourceHost+src;
+          if(!src.startsWith('http'))return;
+          if(seen.has(src))return;seen.add(src);
+          const w=parseInt(img.getAttribute('width')||img.naturalWidth||'0');
+        const h=parseInt(img.getAttribute('height')||img.naturalHeight||'0');
+        if((w&&w<80)||(h&&h<60))return;// skip tiny images
+        const alt=(img.getAttribute('alt')||'').trim();
+        imgs.push({url:src,caption:alt.slice(0,100)});
+      });
+      return imgs.slice(0,4);
+    }
+
+    const SOURCES=[
+      {name:'Britannica',searchUrl:`https://www.britannica.com/api/search/autosuggest?query=${e2(q)}&num=10`,isJson:true,
+                                                                                                                                                                        fetchLinks(html){try{const j=JSON.parse(html);const hits=j.results||j.suggestions||j||[];const links=[];const seen=new Set();hits.forEach(item=>{let href=item.url||item.articleUrl||'';if(!href)return;if(href.startsWith('/'))href='https://www.britannica.com'+href;if(seen.has(href))return;seen.add(href);const text=item.title||href.split('/').pop().replace(/-/g,' ');links.push({href,text,score:10});});return links;}catch(_){return[];}},
+                                                                                                                                                                        extractArticle(doc,host){const main=doc.querySelector('article.topic-content,article,[data-topic-id],#content-reset')||doc.querySelector('main')||doc.body;stripNoise(main);const cad=grabColAutoData(doc);return{bodyText:cleanBritParas(main),refs:cad.refs.length>0?cad.refs:grabRefs(doc,['.reference-list','.references']),subtopics:cad.subtopics,colAutoMedia:cad.media,images:grabInlineImages(doc,host)};}},
+                                                                                                                                                                        {name:'Britannica-HTML',searchUrl:`https://www.britannica.com/search?query=${e2(q)}`,isJson:false,
+                                                                                                                                                                        fetchLinks(html){const doc=parser.parseFromString(html,'text/html');const links=[];const seen=new Set();doc.querySelectorAll('a[href]').forEach(a=>{const raw=a.getAttribute('href')||'';const text=(a.textContent||'').trim().replace(/\s+/g,' ');if(text.length<2)return;if(!/^\/(topic|science|animal|plant|technology|event|place|biography|art|history|philosophy|religion|geography|music|health|sports)\/[A-Za-z0-9]/.test(raw))return;const href='https://www.britannica.com'+raw;if(seen.has(href))return;seen.add(href);links.push({href,text});});return links;},
+                                                                                                                                                                        extractArticle(doc,host){const main=doc.querySelector('article.topic-content,article,[data-topic-id]')||doc.querySelector('main')||doc.body;stripNoise(main);const cad=grabColAutoData(doc);return{bodyText:cleanBritParas(main),refs:cad.refs.length>0?cad.refs:grabRefs(doc,['.reference-list','.references']),subtopics:cad.subtopics,colAutoMedia:cad.media,images:grabInlineImages(doc,host)};}},
+                                                                                                                                                                        {name:'Wikipedia-Mobile',searchUrl:`https://en.m.wikipedia.org/w/index.php?search=${e2(q)}&ns0=1`,isJson:false,
+                                                                                                                                                                        fetchLinks(html){const doc=parser.parseFromString(html,'text/html');const links=[];const seen=new Set();doc.querySelectorAll('a[href]').forEach(a=>{const raw=a.getAttribute('href')||'';const text=(a.textContent||'').trim().replace(/\s+/g,' ');if(text.length<2)return;const isRel=/^\/wiki\/([^:]+)$/.test(raw);const isAbs=/^https?:\/\/en\.m?\.wikipedia\.org\/wiki\/([^:]+)$/.test(raw);if(!isRel&&!isAbs)return;const href=isRel?`https://en.m.wikipedia.org${raw}`:raw;if(seen.has(href))return;seen.add(href);links.push({href,text});});return links;},
+                                                                                                                                                                        extractArticle(doc,host){const main=doc.querySelector('#mw-content-text')||doc.querySelector('#bodyContent')||doc.body;stripNoise(main);return{bodyText:grabParas(main),refs:grabRefs(doc,['.references','.reflist']),subtopics:grabSubtopics(doc),images:grabInlineImages(doc,host)};}},
+                                                                                                                                                                        {name:'DuckDuckGo',searchUrl:`https://html.duckduckgo.com/html/?q=${e2(q)}`,isJson:false,
+                                                                                                                                                                        fetchLinks(html){const doc=parser.parseFromString(html,'text/html');const links=[];const seen=new Set();doc.querySelectorAll('a.result__a').forEach(a=>{const raw=a.getAttribute('href')||'';const text=(a.textContent||'').trim().replace(/\s+/g,' ');if(text.length<2)return;const isBrit=/britannica\.com\/(topic|science|animal|plant|technology|event|place|biography|art|history)\/[A-Za-z0-9]/.test(raw);const isWiki=/en\.m?\.wikipedia\.org\/wiki\/[^:?#]+$/.test(raw);if(!isBrit&&!isWiki)return;try{const href=new URL(raw).href.split('?')[0];if(seen.has(href))return;seen.add(href);links.push({href,text});}catch(_){}});return links;},
+                                                                                                                                                                        extractArticle(doc,host){const main=doc.querySelector('article.topic-content,article,[data-topic-id],#mw-content-text')||doc.querySelector('main')||doc.body;stripNoise(main);return{bodyText:grabParas(main),refs:grabRefs(doc,['.reference-list','.references','.reflist']),subtopics:grabSubtopics(doc),images:grabInlineImages(doc,host)};}},
+    ];
+
+    let allLinks=[],activeSource=null;
+    for(const src of SOURCES){
+      upd(`Searching ${src.name}…`,src.searchUrl.slice(0,60)+'…');
+      try{
+        const html=await proxyFetch(src.searchUrl,13000);
+        if(html.length<50)throw new Error('too short');
+        const found=src.fetchLinks(html);
+        if(found.length>0){allLinks=found;activeSource=src;break;}
+      }catch(err){this._log(`L2: ${src.name} failed: ${err.message}`);}
+    }
+    if(!allLinks.length)throw new Error('L2: all sources failed');
+
+    upd(`Ranking ${allLinks.length} links…`,'Scoring relevance to query');
+    const ranked=allLinks.map(l=>({...l,score:(l.score||0)+scoreLink(l.text)})).sort((a,b)=>b.score-a.score);
+    const dedupedRanked=[];const hrefSeen=new Set();
+    ranked.forEach(l=>{if(!hrefSeen.has(l.href)){hrefSeen.add(l.href);dedupedRanked.push(l);}});
+    let targets=dedupedRanked.filter(l=>l.score>0).slice(0,5);
+    if(!targets.length)targets=dedupedRanked.slice(0,5);
+
+    const pages=[];
+    for(let i=0;i<targets.length;i++){
+      const t=targets[i];
+      upd(`Scraping article ${i+1}/${targets.length}…`,`"${t.text.slice(0,40)}" — ${activeSource.name}`);
+      try{
+        const rawHtml=await proxyFetch(t.href,15000);
+        if(rawHtml.length<400)throw new Error('too short');
+        const doc=parser.parseFromString(rawHtml,'text/html');
+        let sourceHost='';try{sourceHost=new URL(t.href).origin;}catch(_){}
+        const{bodyText,refs,subtopics,colAutoMedia,images}=activeSource.extractArticle(doc,sourceHost);
+        if(bodyText.length<100)throw new Error('article too short');
+        // Detect Britannica search-result snippets: text starts with "..." → preview only, needs a click
+        const isPreview=bodyText.startsWith('...')||bodyText.startsWith('\u2026')||(bodyText.length<350&&/^\W/.test(bodyText));
+        pages.push({title:t.text||t.href.split('/').pop().replace(/[-_]/g,' '),url:t.href,text:bodyText,refs:refs.slice(0,12),score:t.score,source:activeSource.name,subtopics:subtopics||[],colAutoMedia:colAutoMedia||[],images:images||[],isPreview});
+      }catch(err){this._log(`L2: scrape failed: ${err.message}`);}
+    }
+    if(!pages.length)throw new Error('L2: all scrapes failed');
+
+    upd(`Deduplicating ${pages.length} articles…`,'Jaccard similarity check');
+    function jaccard(a,b){const sa=new Set(a.toLowerCase().split(/\s+/).filter(w=>w.length>3));const sb=new Set(b.toLowerCase().split(/\s+/).filter(w=>w.length>3));if(!sa.size||!sb.size)return 0;let inter=0;sa.forEach(w=>{if(sb.has(w))inter++;});return inter/(sa.size+sb.size-inter);}
+    const used=new Set();const groups=[];
+    for(let i=0;i<pages.length;i++){
+      if(used.has(i))continue;const g={pages:[pages[i]]};
+      for(let j=i+1;j<pages.length;j++){if(used.has(j))continue;if(jaccard(pages[i].text,pages[j].text)>=0.40){g.pages.push(pages[j]);used.add(j);}}
+      used.add(i);groups.push(g);
+    }
+    let finalText='';const refBlock=[];
+    for(let k=0;k<groups.length;k++){
+      if(k>0)finalText+='\n\n[Context boundary]\n\n';
+      for(const p of groups[k].pages){finalText+=p.text+'\n';refBlock.push(...p.refs.map(r=>`[${p.title}] ${r}`));}
+    }
+    if(refBlock.length)finalText+='\n\nReferences:\n'+refBlock.join('\n');
+    const finalTitle=pages.map(p=>p.title).slice(0,2).join(' / ');
+    fin(`${pages.length} articles retrieved`,`${finalText.length} chars · ${refBlock.length} refs`);
+    dot('d-prx','on');this.layer='L2';setHl('L2');
+    return{text:finalText.slice(0,16000),title:finalTitle,layer:'L2',groups:groups.length,pages:pages.length,rawPages:pages,sourceName:activeSource.name};
+  }
+
+  // ── L4: Google CSE via relay iframe + postMessage polling ────────
+  async fetchCSE(q){
+    this._log(`L4: CSE "${q.slice(0,30)}"`);dot('d-cse','bz');
+    const e=encodeURIComponent;
+    const RELAY='https://roarx-dev.github.io/DESERT-RAFT/';
+    return new Promise((resolve,reject)=>{
+      let settled=false;
+      const TIMEOUT=18000;
+      const timer=setTimeout(()=>{
+        if(settled)return;settled=true;
+        cleanup();dot('d-cse','er');
+        reject(new Error('CSE relay timeout'));
+      },TIMEOUT);
+
+      // Hidden iframe — NO sandbox so postMessage isn't blocked
+      const iframe=document.createElement('iframe');
+      iframe.style.cssText='position:fixed;width:1px;height:1px;opacity:0;pointer-events:none;top:-9999px;left:-9999px;border:none;';
+      iframe.src=`${RELAY}?q=${e(q)}`;
+      document.body.appendChild(iframe);
+
+      function cleanup(){
+        try{document.body.removeChild(iframe);}catch(_){}
+        window.removeEventListener('message',onMsg);
+        clearTimeout(timer);
+      }
+
+      function onMsg(ev){
+        // Accept messages from roarx-dev.github.io or github.io broadly
+        if(!ev.origin.includes('github.io'))return;
+        const d=ev.data;
+        if(!d||d.type!=='cse-results')return;
+        if(settled)return;
+        settled=true;
+        cleanup();
+
+        const links=(d.items||[])
+        .map(r=>({href:r.href||'',text:r.title||''}))
+        .filter(r=>r.href.startsWith('http')&&r.text.length>1);
+        const images=(d.images||[])
+        .filter(im=>im&&im.url&&im.url.startsWith('http'))
+        .slice(0,30);
+
+        dot('d-cse',links.length?'on':'er');
+        resolve({links:links.slice(0,50),images});
+      }
+
+      window.addEventListener('message',onMsg);
+    });
+  }
+
+  async ingest(q,act,_searchStrOverride){
+    const searchQ=_searchStrOverride||q;
+    const step=(icon,msg,sub)=>act?.addStep(icon,msg,sub);
+    const finish=(el,icon,msg,sub,fail)=>act?.finishStep(el,icon,msg,sub,fail);
+    const s0=step('','Fetching Wikipedia…','REST v1 + Action API');
+    const s1=step('','Fetching DuckDuckGo…','Instant Answers');
+    const sP=step('','Fetching Britannica / Wikipedia…','Multi-source proxy scrape');
+    const settle=p=>p.then(v=>({ok:true,v})).catch(e=>({ok:false,e}));
+    const [r0,r1,rP]=await Promise.all([
+      settle(this.fetchWiki(searchQ).then(v=>{finish(s0,'','Wikipedia: '+v.title.slice(0,35),v.text.length+' chars');return v;}).catch(e=>{finish(s0,'','Wikipedia failed',e.message,true);throw e;})),
+                                       settle(this.fetchDDG(searchQ).then(v=>{finish(s1,'','DuckDuckGo: '+v.title.slice(0,35),v.text.length+' chars');return v;}).catch(e=>{finish(s1,'','DuckDuckGo failed',e.message,true);throw e;})),
+                                       settle(this.fetchWebScrape(searchQ,act,sP).then(v=>v).catch(e=>{finish(sP,'','Proxy scrape failed',e.message,true);throw e;}))
+    ]);
+    const hits=[r0,r1,rP].filter(r=>r.ok).map(r=>r.v);
+    if(hits.length){
+      const combined=hits.map(h=>`[${h.layer}] ${h.text}`).join('\n\n');
+      const title=hits.map(h=>h.title).filter(Boolean).slice(0,2).join(' / ');
+      const bestLayer=hits[0].layer;this.layer=bestLayer;setHl(bestLayer);
+      const l2=hits.find(h=>h.layer==='L2');
+      const wikiHit=hits.find(h=>h.layer==='L0');
+      const ddgHit=hits.find(h=>h.layer==='L1');
+      // Merge images and related topics from all sources
+      const allImages=[...(wikiHit?.images||[]),...(ddgHit?.images||[])];
+      const allRelated=[...(wikiHit?.relatedTopics||[]),...(ddgHit?.relatedTopics||[])];
+      return{text:combined.slice(0,18000),title,layer:bestLayer,groups:hits.reduce((s,h)=>s+(h.groups||1),0),pages:hits.reduce((s,h)=>s+(h.pages||0),0),rawPages:l2?.rawPages||null,sourceName:l2?.sourceName||null,images:allImages.slice(0,20),relatedTopics:[...new Set(allRelated)].slice(0,10),refUrl:wikiHit?.refUrl||ddgHit?.refUrl||''};
+    }
+    this._log('L3: pre-trained');dot('d-l3','on');this.layer='L3';setHl('L3');
+    return{text:'',title:q,layer:'L3',images:[],relatedTopics:[]};
+  }
+}
+
+// ── UTILS ──────────────────────────────────────────────────────────
+const $=id=>document.getElementById(id);
+function dot(id,st){const el=$(id);if(!el)return;el.className='dot'+(st==='on'?' on':st==='bz'?' bz':st==='er'?' er':'');}
+function setStatus(m){$('smsg').textContent=m;}
+function setHl(l){$('hl').textContent=l;}
+function esc(t){return(t||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+function ts(){return new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});}
+function updateStats(){$('hn').textContent=bm25.docs.length;$('hv').textContent=bm25.vocabSz;}
+function scrollBottom(){const m=$('msgs');m.scrollTop=m.scrollHeight;}
+function mi(){return $('msgs-inner');}
+
+// ── WORD-BY-WORD TYPEWRITER ─────────────────────────────────────────
+function typewriterWords(el,text,delayMs=48,startDelay=0){
+  return new Promise(resolve=>{
+    // Split on whitespace, preserving newlines as separate tokens
+    const rawTokens=text.split(/(\n)/);
+    const words=[];
+    rawTokens.forEach(tok=>{
+      if(tok==='\n'){words.push('\n');}
+      else{tok.split(' ').forEach(w=>{if(w.length>0)words.push(w);});}
+    });
+    el.innerHTML='';
+    let i=0;
+    // Use a document fragment to batch first few words for snappiness
+    function next(){
+      if(i>=words.length){resolve();return;}
+      const w=words[i];
+      if(w==='\n'){
+        el.appendChild(document.createElement('br'));
+      } else {
+        const span=document.createElement('span');
+        span.className='typing-word';
+        span.textContent=(i===0||words[i-1]==='\n'?'':' ')+w;
+        el.appendChild(span);
+      }
+      i++;
+      // Only scroll every ~5 words to reduce layout thrashing
+      if(i%5===0)scrollBottom();
+      setTimeout(next,delayMs);
+    }
+    setTimeout(next,startDelay);
+  });
+}
+
+// ── ADD MESSAGE ────────────────────────────────────────────────────
+const ICONS={u:'U',s:'RF',i:'↓',e:'!'};
+const NAMES={u:'You',s:'Ruminance',i:'Ingest',e:'Error'};
+function addMsg(content,type='s',lbl){
+  const row=document.createElement('div');row.className='msg-row';
+  const t=type[0];
+  row.innerHTML=`<div class="msg-meta">
+  <div class="msg-icon ${t}">${ICONS[t]||'RC'}</div>
+  <div class="msg-sender">${lbl||NAMES[t]||'Ruminance'}</div>
+  <div class="msg-time">${ts()}</div>
+  </div>
+  <div class="msg-content${t==='i'?' dim':t==='e'?' err':''}"><pre>${esc(content)}</pre></div>`;
+  mi().appendChild(row);scrollBottom();return row;
+}
+
+// ── CONVERSATIONAL STREAM ─────────────────────────────────────────
+function createConvStream(){
+  const block=document.createElement('div');
+  block.className='conv-block';
+  const uid='cb'+Date.now();
+  block.innerHTML=`
+  <div class="conv-meta">
+  <div class="conv-avatar">RC</div>
+  <div class="conv-sender">Ruminance</div>
+  <div class="conv-time">${ts()}</div>
+  </div>
+  <div class="conv-body" id="${uid}"></div>`;
+  mi().appendChild(block);scrollBottom();
+  const body=block.querySelector(`#${uid}`);
+
+  // Add a prose paragraph with word-by-word typewriter
+  async function addPara(text,cls='',instant=false){
+    const p=document.createElement('p');
+    p.className='conv-para'+(cls?' '+cls:'');
+    body.appendChild(p);scrollBottom();
+    if(instant){p.innerHTML=text;return p;}
+    // Strip HTML for animation, then restore ONLY if text actually contains markup
+    const plainText=text.replace(/<[^>]+>/g,'').replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&amp;/g,'&');
+    await typewriterWords(p,plainText,48);
+    // Only swap back to raw HTML if there's actual markup to restore (avoids flash for plain text)
+    if(/<[a-zA-Z]/.test(text))p.innerHTML=text;
+    scrollBottom();
+    return p;
+  }
+
+  // SVG icons for widget types
+  const WIDGET_ICONS={
+    wiki:`<svg viewBox="0 0 14 14" fill="none" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="7" cy="7" r="6"/><path d="M4.5 5h2L7 9l.5-4H9"/><path d="M4.5 9h5"/></svg>`,
+    ddg:`<svg viewBox="0 0 14 14" fill="none" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="6" r="4.5"/><path d="M9.5 9.5l3 3"/></svg>`,
+    proxy:`<svg viewBox="0 0 14 14" fill="none" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M7 1v12M1 7h12M3 3l8 8M11 3l-8 8"/></svg>`,
+    cse:`<svg viewBox="0 0 14 14" fill="none" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="1" y="1" width="12" height="12" rx="2"/><path d="M4 7h6M7 4v6"/></svg>`,
+    index:`<svg viewBox="0 0 14 14" fill="none" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2 4h10M2 7h7M2 10h5"/><circle cx="11" cy="10" r="2.5"/><path d="M12.5 11.5l1.5 1.5"/></svg>`,
+  };
+
+  // Collapsible action widget — prose narration written OUTSIDE by caller
+  function addThinkPhase(sourceType,title,icon,badge){
+    const svgIcon=WIDGET_ICONS[sourceType]||WIDGET_ICONS.proxy;
+    const wid='aw'+Math.random().toString(36).slice(2,8);
+    const widget=document.createElement('div');
+    widget.className='act-widget';
+    widget.innerHTML=`
+    <div class="act-widget-hdr" onclick="(function(h){const b=h.nextElementSibling;b.classList.toggle('collapsed');h.querySelector('.act-widget-chevron').classList.toggle('open');})(this)">
+    <div class="act-widget-icon live" id="${wid}-icon">${svgIcon}</div>
+    <div class="act-widget-meta">
+    <div class="act-widget-title live" id="${wid}-title">${esc(title)}</div>
+    <div class="act-widget-sub">${esc(badge)}</div>
+    </div>
+    <div class="act-widget-right">
+    <div class="act-widget-status"><div class="aw-dot live" id="${wid}-dot"></div><span id="${wid}-stxt">Running</span></div>
+    <div class="act-widget-chevron">
+    <svg viewBox="0 0 12 12" fill="none" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 4.5l3 3 3-3"/></svg>
+    </div>
+    </div>
+    </div>
+    <div class="act-widget-body collapsed" id="${wid}-body">
+    <div class="act-steps-list" id="${wid}-steps"></div>
+    </div>`;
+    body.appendChild(widget);scrollBottom();
+    const wIcon=widget.querySelector(`#${wid}-icon`);
+    const wTitle=widget.querySelector(`#${wid}-title`);
+    const wDot=widget.querySelector(`#${wid}-dot`);
+    const wStxt=widget.querySelector(`#${wid}-stxt`);
+    const wSteps=widget.querySelector(`#${wid}-steps`);
+
+    function _setState(state){
+      const cls=state==='live'?'live':state==='done'?'done':'fail';
+      wIcon.className=`act-widget-icon ${cls}`;
+      wTitle.className=`act-widget-title ${cls}`;
+      wDot.className=`aw-dot ${cls}`;
+      wStxt.textContent=state==='live'?'Running':state==='done'?'Done':'Failed';
+    }
+
+    function addThinkStep(text,sub='',state='live'){
+      const step=document.createElement('div');
+      step.className=`act-step ${state}`;
+      const now=new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',second:'2-digit'});
+      step.innerHTML=`
+      <div class="act-step-track"><div class="act-step-node"></div><div class="act-step-line"></div></div>
+      <div class="act-step-content">
+      <div class="act-step-label">${esc(text)}${state==='live'?`<span class="idots"><i></i><i></i><i></i></span>`:''}</div>
+      ${sub?`<div class="act-step-detail">${esc(sub)}</div>`:''}
+      </div>
+      <div class="act-step-time">${now}</div>`;
+      wSteps.appendChild(step);scrollBottom();
+      return step;
+    }
+    function updateThinkStep(el,text,sub,state){
+      if(!el||!el.parentNode)return;
+      el.className=`act-step ${state}`;
+      const now=new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',second:'2-digit'});
+      el.innerHTML=`
+      <div class="act-step-track"><div class="act-step-node"></div><div class="act-step-line"></div></div>
+      <div class="act-step-content">
+      <div class="act-step-label">${esc(text)}${state==='live'?`<span class="idots"><i></i><i></i><i></i></span>`:''}</div>
+      ${sub?`<div class="act-step-detail">${esc(sub)}</div>`:''}
+      </div>
+      <div class="act-step-time">${now}</div>`;
+      scrollBottom();
+    }
+    function finishThinkStep(el,text,sub,fail){
+      if(!el||!el.parentNode)return;
+      updateThinkStep(el,text,sub,fail?'fail':'done');
+    }
+    function finishWidget(fail){_setState(fail?'fail':'done');}
+    return{phase:widget,addThinkStep,updateThinkStep,finishThinkStep,finishWidget};
+  }
+
+  // Legacy status line (kept for compat — now just wraps think-steps)
+  function addStatus(text,sub,state='live'){
+    const el=document.createElement('div');
+    el.className='status-line '+state;
+    el.innerHTML=`<div class="sl-dot"></div>
+    <span class="sl-text">${esc(text)}${state==='live'?`<span class="idots"><i></i><i></i><i></i></span>`:''}</span>
+    ${sub?`<span class="sl-sub">${esc(sub)}</span>`:''}`;
+    body.appendChild(el);scrollBottom();return el;
+  }
+  function updateStatus(el,text,sub,state){
+    el.className='status-line '+state;
+    el.innerHTML=`<div class="sl-dot"></div>
+    <span class="sl-text">${esc(text)}${state==='live'?`<span class="idots"><i></i><i></i><i></i></span>`:''}</span>
+    ${sub?`<span class="sl-sub">${esc(sub)}</span>`:''}`;
+    scrollBottom();
+  }
+  function finishStatus(el,text,sub,fail){updateStatus(el,text,sub,fail?'fail':'done');}
+
+  // Add article as flowing paragraphs with inline images scattered throughout
+  function addArticle(page,idx,total,sourceName){
+    const prose=document.createElement('div');
+    prose.className='art-prose';
+
+    // ── Britannica preview card: search result snippet, not a full article ──
+    if(page.isPreview){
+      const card=document.createElement('div');card.className='brit-preview';
+      card.innerHTML=`<div class="brit-preview-icon">📖</div>
+      <div class="brit-preview-body">
+      <div class="brit-preview-title">${esc(page.title)}</div>
+      <div class="brit-preview-snippet">${esc((page.text||'').replace(/^\.{2,}\s*/,'').slice(0,90))}…</div>
+      </div>
+      <div class="brit-preview-cta">Read →</div>`;
+      card.onclick=()=>handleQuery(page.title);
+      if(page.url){
+        const ext=document.createElement('a');ext.href=page.url;ext.target='_blank';ext.rel='noopener';
+        ext.style.cssText='position:absolute;top:8px;right:70px;font-size:9px;color:var(--text3);text-decoration:none;opacity:.5;';
+        ext.textContent='open ↗';card.style.position='relative';card.appendChild(ext);
+      }
+      body.appendChild(card);
+      if(idx<total-1){const div=document.createElement('div');div.className='art-divider';body.appendChild(div);}
+      scrollBottom();return;
+    }
+
+    const sourceLabel=`${esc(sourceName||'Web')}${page.url?` · <a href="${esc(page.url)}" target="_blank" rel="noopener" style="color:var(--text3);font-size:10px;text-decoration:none;opacity:.6">${esc(page.url)}</a>`:''}`;
+    const titleEl=document.createElement('div');titleEl.className='art-prose-title';titleEl.textContent=page.title||'Article';
+    const srcEl=document.createElement('div');srcEl.className='art-prose-source';srcEl.innerHTML=sourceLabel;
+    prose.appendChild(titleEl);prose.appendChild(srcEl);
+
+    // Build article content with inline images
+    const contentDiv=document.createElement('div');contentDiv.className='art-prose-content art-clearfix';
+
+    // Split text into paragraphs
+    const rawText=(page.text||'').trim();
+    const paragraphs=rawText.split(/\n{2,}|\n(?=[A-Z])/).map(p=>p.trim()).filter(p=>p.length>30);
+    const images=page.images||[];
+
+    // Place images inline: one after paragraph ~2, one after ~5 (if available)
+    const imgPositions=[1,4];
+    let imgIdx=0;
+
+    paragraphs.forEach((para,i)=>{
+      // Insert image before this paragraph if scheduled
+      if(imgPositions.includes(i)&&imgIdx<images.length){
+        const imgData=images[imgIdx++];
+        const imgWrap=document.createElement('div');
+        imgWrap.className='art-img-wrap';
+        imgWrap.innerHTML=`<img src="${esc(imgData.url)}" alt="${esc(imgData.caption)}" loading="lazy" onerror="this.parentNode.style.display='none'">
+        ${imgData.caption?`<div class="art-img-caption">${esc(imgData.caption)}</div>`:''}`;
+        contentDiv.appendChild(imgWrap);
+      }
+      const pEl=document.createElement('p');
+      pEl.textContent=para;
+      contentDiv.appendChild(pEl);
+    });
+
+    // If we have leftover images, don't show them after (per requirements)
+    prose.appendChild(contentDiv);
+
+    // col-auto: subtopics + media strip + references + full article link
+    const colAuto=document.createElement('div');colAuto.className='col-auto';
+    const subtopics=page.subtopics||[];
+    const colAutoMedia=page.colAutoMedia||[];
+    const pageRefs=page.refs||[];
+    if(subtopics.length>0){
+      const subLabel=document.createElement('div');subLabel.className='col-auto-label';subLabel.textContent='Subtopics';
+      colAuto.appendChild(subLabel);
+      const grid=document.createElement('div');grid.className='subtopics-grid';
+      subtopics.forEach(st=>{
+        const chip=document.createElement('button');chip.className='subtopic-chip';
+        chip.innerHTML=`<span class="chip-icon">→</span>${esc(st.text)}`;
+        chip.onclick=()=>handleQuery(st.text);
+        grid.appendChild(chip);
+      });
+      colAuto.appendChild(grid);
+    }
+    // Media strip from col-auto sidebar (images + video thumbnails)
+    if(colAutoMedia.length>0){
+      const mediaLabel=document.createElement('div');mediaLabel.className='col-auto-label';mediaLabel.style.marginTop='10px';mediaLabel.textContent='Media';
+      colAuto.appendChild(mediaLabel);
+      const strip=document.createElement('div');strip.className='media-strip';
+      colAutoMedia.forEach(m=>{
+        const thumb=document.createElement('div');
+        thumb.className='media-thumb'+(m.type==='video'?' video':'');
+        thumb.title=m.caption||'';
+        thumb.innerHTML=`<img src="${esc(m.url)}" alt="${esc(m.caption)}" loading="lazy" onerror="this.parentNode.style.display='none'">`;
+        thumb.onclick=()=>openImgModal(m.url);
+        strip.appendChild(thumb);
+      });
+      colAuto.appendChild(strip);
+    }
+    // References from col-auto citations
+    if(pageRefs.length>0){
+      const refLabel=document.createElement('div');refLabel.className='col-auto-label';refLabel.style.marginTop='10px';refLabel.textContent='References';
+      colAuto.appendChild(refLabel);
+      const refList=document.createElement('div');refList.style.cssText='display:flex;flex-direction:column;gap:5px;margin-bottom:8px;';
+      pageRefs.slice(0,5).forEach(r=>{
+        const refEl=document.createElement('div');
+        refEl.style.cssText='font-size:11px;color:var(--text3);line-height:1.5;padding:3px 0 3px 8px;border-left:2px solid var(--border2);';
+        refEl.textContent=r;
+        refList.appendChild(refEl);
+      });
+      colAuto.appendChild(refList);
+    }
+    if(page.url){
+      const refLink=document.createElement('a');refLink.className='ref-link';refLink.href=page.url;refLink.target='_blank';refLink.rel='noopener';
+      refLink.innerHTML=`<svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M4 2H2a1 1 0 0 0-1 1v5a1 1 0 0 0 1 1h5a1 1 0 0 0 1-1V6M6 1h3m0 0v3m0-3L4.5 5.5"/></svg> Full article`;
+      colAuto.appendChild(refLink);
+    }
+    prose.appendChild(colAuto);
+
+    body.appendChild(prose);
+    if(idx<total-1){const div=document.createElement('div');div.className='art-divider';body.appendChild(div);}
+    scrollBottom();
+  }
+
+  // Summary + related topic suggestions
+  async function addSummary(q,retrieved,ingLayer,markovGen,relatedTopics,synthImages){
+    const{results,qterms}=retrieved;
+    const top=results.filter(r=>r.score>0).slice(0,8);
+    const markovTxt=markovGen?.txt||'';
+
+    addPara('Here\'s a synthesis of the most relevant passages I found, ranked by relevance to your query.','' ,true);
+
+    if(!top.length){
+      addPara('No strongly-matching passages in the current corpus — try a more specific query.','muted',true);
+    } else {
+      const sum=document.createElement('div');sum.className='sum-prose';
+
+      // Narrative intro paragraph built from top passage themes
+      const topPassages=top.slice(0,3).map(r=>r.d.text);
+      const keyTerms=qterms.slice(0,4).join(', ');
+      const sourceNames=[...new Set(top.map(r=>(r.d.src||'').split(':')[0]).filter(Boolean))].slice(0,3).join(', ');
+      const introPara=document.createElement('p');
+      introPara.className='conv-para';
+      introPara.style.cssText='font-size:13.5px;line-height:1.78;color:var(--text2);margin-bottom:14px;';
+      introPara.textContent=`Based on what I read across ${top.length} passages from ${sourceNames||ingLayer}, here is what stands out most about "${q}". The key themes running through the material are: ${keyTerms}. I've ranked everything below by how well it matches your question — the top passage scored ${top[0].score.toFixed(2)} on BM25.`;
+      sum.appendChild(introPara);
+
+      top.forEach((r,idx)=>{
+        const p=document.createElement('div');p.className='sum-passage';
+        const label=idx===0?'Most relevant':'';
+        p.innerHTML=`<div class="sum-passage-text">${esc(r.d.text)}</div>
+        <div class="sum-passage-meta">${label?`<b style="color:var(--orange);margin-right:6px">${label}</b>`:''}relevance ${r.score.toFixed(2)} · ${esc((r.d.src||'').slice(0,30))}</div>`;
+        sum.appendChild(p);
+      });
+
+      if(markovTxt&&markovTxt.split(' ').length>3){
+        // ── Rich Language Synthesis card ──────────────────────────
+        const synth=document.createElement('div');synth.className='synth-block';
+        const termList=qterms.slice(0,5).join(', ');
+        const wordCount=markovTxt.split(/\s+/).filter(Boolean).length;
+        const strCount=(markovGen?.strings||[]).length||1;
+        const bridgeCount=(markovGen?.bridges||[]).length||0;
+        const kgSt=kg.stats();
+        synth.innerHTML=`<div class="synth-hdr">
+        <div class="synth-hdr-icon">✦</div>
+        <div class="synth-hdr-label">Language Synthesis</div>
+        <div class="synth-hdr-sub">TF-IDF · Cosine · MMR · Concept-filter · ${wordCount} words · ${strCount} string${strCount!==1?'s':''} · ${bridgeCount} bridge${bridgeCount!==1?'s':''} · KG ${kgSt.triples}t/${kgSt.inferred||0}inf · top cos ${markovGen?.topScore?.toFixed(3)||'—'}</div>
+        </div>
+        <div class="synth-body" id="synth-body-${Date.now()}"></div>`;
+        sum.appendChild(synth);
+        const synthBody=synth.querySelector('[id^="synth-body"]');
+
+        // ── KG concept intro (generated from learned triples) ──────
+        const kgIntro=await kg.generateIntro(q);
+        if(typeof ThesaurusEngine!=='undefined') ThesaurusEngine.purgeCache(kg);
+
+        if(kgIntro){
+          const kgBox=document.createElement('div');
+          kgBox.style.cssText='background:rgba(217,119,6,0.07);border:1px solid rgba(217,119,6,0.2);border-radius:7px;padding:10px 13px;margin-bottom:12px;';
+          kgBox.innerHTML=`<div style="font-size:9.5px;font-weight:700;color:var(--orange);text-transform:uppercase;letter-spacing:.7px;margin-bottom:5px;opacity:.8;">Concept Knowledge</div>
+          <div style="font-size:13px;line-height:1.7;color:var(--text2);">${esc(kgIntro)}</div>`;
+          synthBody.appendChild(kgBox);
+        }
+
+        // Intro note
+        const intro=document.createElement('div');intro.className='synth-intro';
+        intro.textContent=`Assembled via TF-IDF cosine similarity + type-diverse MMR (λ=0.65) + concept-coherence filter from Knowledge Graph (${kgSt.triples} triples · ${kgSt.concepts} concepts · ${kgSt.vocab} vocab). Sentences are lego-connected into strings by shared content words; inter-string concept bridges are annotated. Key terms: ${termList}.`;
+        synthBody.appendChild(intro);
+
+        // Images row — pick up to 3 from corpus images
+        const imgs=(synthImages||[]).filter(im=>im&&im.url).slice(0,3);
+        if(imgs.length>0){
+          const imgRow=document.createElement('div');imgRow.className='synth-img-row';
+          imgs.forEach(im=>{
+            const cell=document.createElement('div');cell.className='synth-img-cell';
+            cell.innerHTML=`<img src="${esc(im.url)}" alt="${esc(im.caption||'')}" loading="lazy" onerror="this.closest('.synth-img-cell').style.display='none'">
+            ${im.caption?`<div class="synth-img-cell-cap">${esc(im.caption)}</div>`:''}`;
+            imgRow.appendChild(cell);
+          });
+          synthBody.appendChild(imgRow);
+        }
+
+        // Synthesis text — strings as paragraphs, bridge notes in distinct style
+        const synthDiv=document.createElement('div');synthDiv.className='synth-text';
+        const paragraphs=markovGen?.paragraphs||markovTxt.split(/\n\n+/).filter(p=>p.trim());
+        paragraphs.forEach((para,ci)=>{
+          if(!para.trim())return;
+          const isBridge=/^\[Concepts "/.test(para.trim());
+          const p=document.createElement('p');
+          if(isBridge){
+            p.style.cssText='font-size:11.5px;line-height:1.6;color:var(--text3);font-style:italic;padding:5px 10px;border-left:2px solid rgba(217,119,6,0.35);margin-bottom:8px;opacity:.75;';
+            p.textContent=para.trim().replace(/^\[|\]$/g,'');
+          } else {
+            p.className='synth-text-para';
+            p.textContent=para.trim();
+          }
+          synthDiv.appendChild(p);
+          if(ci===0&&imgs.length===0&&(synthImages||[]).length>3){
+            const extraImg=(synthImages||[])[3];
+            if(extraImg?.url){
+              const extra=document.createElement('div');
+              extra.style.cssText='float:right;margin:0 0 10px 14px;max-width:180px;border-radius:6px;overflow:hidden;border:1px solid var(--border);';
+              extra.innerHTML=`<img src="${esc(extraImg.url)}" alt="${esc(extraImg.caption||'')}" style="width:100%;height:100px;object-fit:cover;display:block;" onerror="this.closest('div').style.display='none'">`;
+              synthDiv.insertBefore(extra,p);
+            }
+          }
+        });
+        synthBody.appendChild(synthDiv);
+
+        // ── Learned Facts panel — multi-level inference display ──
+        const curated=kg.curatedFacts(q,16);
+        if(curated.length>0){
+          const factsBox=document.createElement('div');
+          factsBox.style.cssText='margin-top:16px;border-top:1px solid var(--border);padding-top:14px;';
+
+          const kgSt2=kg.stats();
+          const inferredCount=curated.reduce((sum,g)=>{
+            return sum+([...g.objects.values()].filter(o=>o.conf<0.65).length);
+          },0);
+
+          factsBox.innerHTML=`<div style="display:flex;align-items:center;gap:8px;margin-bottom:10px;">
+          <div style="font-size:9.5px;font-weight:700;color:var(--text3);text-transform:uppercase;letter-spacing:.7px;opacity:.7;">What I've Learned About This Topic</div>
+          <div style="margin-left:auto;font-size:9px;color:var(--text3);opacity:.5;">${kgSt2.triples} triples · ${kgSt2.inferred||0} inferred</div>
+          </div>`;
+
+          // Group curated facts by relation family for structured display
+          const byFamily={};
+          for(const g of curated){
+            const fam=g.family||'other';
+            if(!byFamily[fam])byFamily[fam]=[];
+            byFamily[fam].push(g);
+          }
+
+          const FAM_LABEL={
+            identity:'Identity',property:'Properties',structure:'Structure',
+            location:'Location & Origin',event:'Events',causal:'Causes & Effects',
+            authority:'Authority',purpose:'Purpose',output:'Output',
+            relation:'Relations',change:'Change',metric:'Metrics',
+            description:'Description',other:'Other',
+          };
+          const FAM_ORDER=['identity','property','causal','structure','location','event','authority','purpose','output','relation','change','metric','description','other'];
+          const FAM_COLOR={
+            identity:'var(--orange)',property:'var(--blue)',causal:'var(--red)',
+                                                                                                                                                                        structure:'#a78bfa',location:'#34d399',event:'#f59e0b',
+                                                                                                                                                                        authority:'#fb923c',purpose:'#60a5fa',output:'#4ade80',
+                                                                                                                                                                        relation:'var(--text3)',change:'#c084fc',metric:'#38bdf8',
+                                                                                                                                                                        description:'var(--text3)',other:'var(--text3)',
+          };
+
+          const REL_LABEL_FULL={
+            'is-a':'is a','defined-as':'defined as','classified-as':'classified as',
+            'classified-under':'under','member-of':'member of',
+            'has-property':'is','has-part':'contains','part-of':'part of','includes':'includes',
+            'located-in':'located in','origin-of':'origin of','derived-from':'derived from',
+            'established':'established','ended':'ended','succeeded':'succeeded','preceded':'preceded',
+            'causes':'causes','caused-by':'caused by','enables':'enables','prevents':'prevents',
+            'requires':'requires','indirectly-causes':'indirectly leads to',
+            'governs':'governs','created-by':'created by','used-for':'used for','produces':'produces',
+            'affects':'affects','supports':'supports','opposes':'opposes','connected-to':'connected to',
+            'associated-with':'assoc. with','differs-from':'differs from','interacts-with':'interacts with',
+            'transforms-into':'→','increases':'increases','reduces':'reduces',
+            'measures':'measures','describes':'describes','concerns':'concerns',
+          };
+
+          for(const fam of FAM_ORDER){
+            const groups=byFamily[fam];if(!groups||!groups.length)continue;
+            const famEl=document.createElement('div');
+            famEl.style.cssText='margin-bottom:10px;';
+            const famHdr=document.createElement('div');
+            famHdr.style.cssText=`font-size:8.5px;font-weight:700;color:${FAM_COLOR[fam]||'var(--text3)'};text-transform:uppercase;letter-spacing:.8px;margin-bottom:5px;opacity:.75;`;
+            famHdr.textContent=FAM_LABEL[fam]||fam;
+            famEl.appendChild(famHdr);
+
+            const grid=document.createElement('div');
+            grid.style.cssText='display:flex;flex-wrap:wrap;gap:5px;';
+
+            for(const g of groups){
+              // Best representative subject
+              const subj=[...g.subjects].sort((a,b)=>a.length-b.length)[0];
+              const objs=[...g.objects.values()].sort((a,b)=>b.conf-a.conf).slice(0,3);
+
+              // One chip per object (or merged if same relation)
+              for(const objEntry of objs){
+                const isInferred=objEntry.conf<0.65||(g.src&&g.src.startsWith('infer:'));
+                const relLabel=REL_LABEL_FULL[objEntry.rel]||objEntry.rel.replace(/-/g,' ');
+                const chip=document.createElement('div');
+                chip.style.cssText=`font-size:10.5px;padding:3px 8px;border-radius:5px;border:1px solid ${isInferred?'rgba(96,165,250,0.25)':'var(--border)'};background:${isInferred?'rgba(96,165,250,0.06)':'var(--bg3)'};color:var(--text2);cursor:pointer;transition:all .15s;display:flex;align-items:center;gap:4px;flex-shrink:0;`;
+                chip.title=`Conf: ${(objEntry.conf*100).toFixed(0)}%${isInferred?' (inferred)':''} · src: ${g.src||'—'}`;
+                chip.innerHTML=`<b style="color:var(--text)">${esc(subj)}</b><span style="color:${FAM_COLOR[fam]||'var(--text3)'};opacity:.8;white-space:nowrap;flex-shrink:0"> ${esc(relLabel)} </span><span>${esc(objEntry.text)}</span>${isInferred?`<span style="font-size:8px;color:var(--blue);opacity:.6;flex-shrink:0;margin-left:2px">↻</span>`:''}${g.count>1?`<span style="font-size:8px;opacity:.4;flex-shrink:0;margin-left:2px">×${g.count}</span>`:''}`;
+                chip.onmouseenter=()=>chip.style.borderColor=FAM_COLOR[fam]||'var(--orange)';
+                chip.onmouseleave=()=>chip.style.borderColor=isInferred?'rgba(96,165,250,0.25)':'var(--border)';
+                chip.onclick=()=>handleQuery(`${subj} ${objEntry.rel.replace(/-/g,' ')} ${objEntry.text}`);
+                grid.appendChild(chip);
+              }
+            }
+            famEl.appendChild(grid);
+            factsBox.appendChild(famEl);
+          }
+
+          // Inter-concept connection summary (same-as + shared-relation concepts)
+          const sameAs=kg.triples.filter(t=>t.rel==='same-as'&&t.conf>=0.6);
+          if(sameAs.length>0){
+            const connEl=document.createElement('div');
+            connEl.style.cssText='margin-top:8px;padding-top:8px;border-top:1px solid var(--border);font-size:10px;color:var(--text3);line-height:1.6;';
+            const pairs=[...new Map(sameAs.map(t=>[`${[t.subj,t.obj].sort().join('↔')}`,t])).values()].slice(0,4);
+            connEl.innerHTML=`<span style="font-size:8.5px;font-weight:700;text-transform:uppercase;letter-spacing:.6px;opacity:.6;">Concept Co-references</span><br>${pairs.map(t=>`<span style="color:var(--text2)">${esc(t.subj)}</span> <span style="opacity:.5">≈</span> <span style="color:var(--text2)">${esc(t.obj)}</span>`).join(' · ')}`;
+            factsBox.appendChild(connEl);
+          }
+
+          synthBody.appendChild(factsBox);
+        }
+      }
+
+      // Closing note
+      const closingPara=document.createElement('p');
+      closingPara.style.cssText='font-size:12px;color:var(--text3);margin-top:12px;line-height:1.6;';
+      closingPara.textContent=`${bm25.docs.length} passages indexed · ${bm25.vocabSz} vocabulary terms · layer ${ingLayer}. Click any subtopic chip above to dive deeper.`;
+      sum.appendChild(closingPara);
+
+      body.appendChild(sum);scrollBottom();
+    }
+
+    // Related topics suggest panel — pick up to 5 topics, suggest 3 as questions
+    const topics=(relatedTopics||[]).filter(Boolean).slice(0,8);
+    if(topics.length>=3){
+      // Pick 3 random topics to suggest as questions
+      const shuffled=[...topics].sort(()=>Math.random()-.5);
+      const picks=shuffled.slice(0,3);
+      const suggest=document.createElement('div');suggest.className='related-suggest';
+      suggest.innerHTML=`<div class="related-suggest-label">You might also want to know</div>
+      <div class="related-suggest-intro">Based on what I found, here are some related topics you might be curious about:</div>
+      <div class="related-suggest-btns"></div>`;
+      const btnsEl=suggest.querySelector('.related-suggest-btns');
+      picks.forEach(topic=>{
+        const btn=document.createElement('button');btn.className='related-btn';
+        btn.textContent=`Tell me about ${topic}`;
+        btn.onclick=()=>{suggest.remove();handleQuery(`Tell me about ${topic}`);};
+        btnsEl.appendChild(btn);
+      });
+      body.appendChild(suggest);scrollBottom();
+    }
+  }
+
+  return{block,body,_body:body,addPara,addThinkPhase,addStatus,updateStatus,finishStatus,addArticle,addSummary};
+}
+
+// ── DEBUG ──────────────────────────────────────────────────────────
+function renderDebug(st){
+  const{sysState,layer,proj,qterms,results,trans,corpus,flog}=st;
+  const vcHtml=(proj||new Array(128).fill(0)).map(v=>`<div class="vc ${v>.66?'hi':v>.33?'md':v>.08?'lo':''}"></div>`).join('');
+  const anchorsHtml=(results||[]).map((r,i)=>{
+    const pct=Math.min(r.score/((results[0]?.score)||1)*100,100).toFixed(0);
+    return`<div style="margin-bottom:6px"><div style="font-size:9px;color:var(--orange)">NODE-${i} · ${r.score.toFixed(3)} · ${esc((r.d.src||'').slice(0,16))}</div><div class="bw"><div class="bf ${i===0?'o':'g'}" style="width:${pct}%"></div></div><div style="font-size:9px;color:var(--text3);overflow:hidden;white-space:nowrap;text-overflow:ellipsis">${esc(r.d.text.slice(0,48))}…</div></div>`;
+  }).join('')||'<span class="dv d">—</span>';
+  const transHtml=(trans||[]).map(t=>`<div style="margin-bottom:5px"><div style="font-size:9px;color:var(--blue)">"${esc(t.k.slice(0,20))}"</div>${(t.probs||[]).map(p=>`<div style="display:flex;gap:4px;align-items:center;font-size:9px"><span style="color:var(--text2);min-width:52px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(p.tok)}</span><div class="bw" style="flex:1"><div class="bf o" style="width:${(p.p*100).toFixed(0)}%"></div></div><span style="color:var(--text3);min-width:24px;text-align:right">${(p.p*100).toFixed(0)}%</span></div>`).join('')}</div>`).join('')||'<span class="dv d">—</span>';
+  const scHtml=(results||[]).map(r=>`<div style="display:flex;gap:4px;align-items:center;font-size:9px;margin-bottom:2px"><div class="bw" style="flex:1"><div class="bf b" style="width:${Math.min(r.score/((results[0]?.score)||1)*100,100).toFixed(0)}%"></div></div><span style="color:var(--text3);min-width:38px;text-align:right">${r.score.toFixed(3)}</span></div>`).join('')||'<span class="dv d">—</span>';
+  const html=`
+  <div class="ds"><div class="dl">State</div><div class="dv">${esc(sysState||'—')}</div></div>
+  <div class="ds"><div class="dl">Layer</div><div class="dv">${layer||'—'}</div></div>
+  <div class="ds"><div class="dl">NLP Intent</div><div class="dv" style="color:var(--orange)">${esc(st.intent||'—')}${st.searchStr?` → <span style="color:var(--text2)">${esc(st.searchStr)}</span>`:''}</div></div>
+  <div class="ds"><div class="dl">Query Vector (128-dim BM25)</div><div class="vg">${vcHtml}</div><div class="dv d" style="font-size:9px">terms: [${(qterms||[]).slice(0,7).join(', ')}]</div></div>
+  <div class="ds"><div class="dl">BM25 Scores</div>${scHtml}</div>
+  <div class="ds"><div class="dl">Top Nodes</div>${anchorsHtml}</div>
+  <div class="ds"><div class="dl">Cosine Top Selections</div>${transHtml}</div>
+  <div class="ds"><div class="dl">Corpus</div><div class="dv">${esc(corpus||'—')}</div></div>
+  <div class="ds"><div class="dl">Fetch Log</div><div class="dv d" style="font-size:9px;line-height:1.7">${esc(flog||'—')}</div></div>`;
+  $('dbg-body').innerHTML=html;$('sheet-body').innerHTML=html;
+}
+
+let dbgOpen=true;
+function toggleDbg(){dbgOpen=!dbgOpen;$('dbg').classList.toggle('hide',!dbgOpen);$('dbg-btn-d').classList.toggle('act',dbgOpen);}
+let sheetOpen=false;
+function toggleSheet(){sheetOpen=!sheetOpen;$('sheet').classList.toggle('open',sheetOpen);$('dbg-btn-m').classList.toggle('act',sheetOpen);}
+
+// ── QUERY LOOP ─────────────────────────────────────────────────────
+let busy=false;
+let advMode=false;
+function toggleAdv(){advMode=!advMode;$('adv-btn').classList.toggle('adv-on',advMode);}
+
+// ── YOUTUBE HELPERS ────────────────────────────────────────────
+function extractYTId(url){
+  try{
+    const u=new URL(url);
+    if(u.hostname.includes('youtu.be')){
+      // youtu.be/VIDEO_ID — path only, ignore all params
+      const id=u.pathname.slice(1).split('/')[0].split('?')[0].trim();
+      return /^[a-zA-Z0-9_-]{11}$/.test(id)?id:null;
+    }
+    if(u.hostname.includes('youtube.com')){
+      if(u.pathname.startsWith('/embed/')){
+        const id=u.pathname.split('/embed/')[1].split('/')[0].split('?')[0].trim();
+        return /^[a-zA-Z0-9_-]{11}$/.test(id)?id:null;
+      }
+      if(u.pathname.startsWith('/shorts/')){
+        const id=u.pathname.split('/shorts/')[1].split('/')[0].split('?')[0].trim();
+        return /^[a-zA-Z0-9_-]{11}$/.test(id)?id:null;
+      }
+      // Standard watch?v=ID — only take the v param, discard everything else
+      const id=(u.searchParams.get('v')||'').trim();
+      return /^[a-zA-Z0-9_-]{11}$/.test(id)?id:null;
+    }
+  }catch(_){}
+  return null;
+}
+function findYTUrlsInText(text){
+  const matches=text.match(/https?:\/\/(www\.)?(youtube\.com\/watch\?[^\s"'<>]+|youtu\.be\/[^\s"'<>]+)/g)||[];
+  return [...new Set(matches)];
+}
+
+let currentYTVideoId = null;
+function updateYTProv(){
+  if(currentYTVideoId) openYTModal(currentYTVideoId, document.getElementById('yt-modal-label').textContent);
+}
+// Toggle setting menu visibility
+document.getElementById('yt-setting-btn').addEventListener('click', (e) => {
+  const m = document.getElementById('yt-setting-menu');
+  m.style.display = m.style.display === 'none' ? 'block' : 'none';
+  e.stopPropagation();
+});
+document.addEventListener('click', () => {
+  const m = document.getElementById('yt-setting-menu');
+  if(m) m.style.display='none';
+});
+
+function openYTModal(videoId,title){
+  currentYTVideoId = videoId;
+  document.getElementById('yt-modal-label').textContent=title||'YouTube Video';
+  const prov = document.querySelector('input[name="yt_prov"]:checked').value;
+  if(prov === 'invidious'){
+    document.getElementById('yt-modal-frame').src=`https://invidious.tiekoetter.com/embed/${videoId}?autoplay=1`;
+  } else {
+    document.getElementById('yt-modal-frame').src=`https://www.youtube.com/embed/${videoId}?rel=0&modestbranding=1&autoplay=1`;
+  }
+  document.getElementById('yt-modal').classList.add('open');
+}
+function closeYTModal(){
+  document.getElementById('yt-modal').classList.remove('open');
+  document.getElementById('yt-modal-frame').src=''; // stop video
+  currentYTVideoId = null;
+}
+document.addEventListener('keydown',e=>{if(e.key==='Escape'){ closeYTModal(); closeImgModal(); }});
+
+// ── IMAGE MODAL HELPERS ───────────────────────────────────────────
+let imgScale = 1;
+let imgTx = 0, imgTy = 0;
+let isDraggingImg = false;
+let startX, startY;
+let initialPinchDistance = null;
+let initialScale = 1;
+
+function openImgModal(url) {
+  const img = document.getElementById('img-modal-img');
+  img.src = url;
+  document.getElementById('img-modal').classList.add('open');
+  imgScale = 1; imgTx = 0; imgTy = 0;
+  updateImgTransform();
+}
+function closeImgModal() {
+  const modal = document.getElementById('img-modal');
+  if(!modal.classList.contains('open')) return;
+  modal.classList.remove('open');
+  document.getElementById('img-modal-img').src = '';
+  if(document.fullscreenElement) document.exitFullscreen();
+}
+function toggleFSImg() {
+  if(!document.fullscreenElement) document.getElementById('img-modal').requestFullscreen().catch(()=>{});
+  else document.exitFullscreen();
+}
+function updateImgTransform() {
+  document.getElementById('img-modal-img').style.transform = `translate(${imgTx}px, ${imgTy}px) scale(${imgScale})`;
+}
+
+// Zoom logic
+document.getElementById('img-modal-wrap').addEventListener('wheel', e => {
+  e.preventDefault();
+  const zoomFactor = 0.1;
+  if(e.deltaY < 0) imgScale += zoomFactor;
+  else imgScale = Math.max(0.5, imgScale - zoomFactor);
+  updateImgTransform();
+});
+
+// Drag/Pan logic
+document.getElementById('img-modal-wrap').addEventListener('mousedown', e => {
+  isDraggingImg = true;
+  startX = e.clientX - imgTx;
+  startY = e.clientY - imgTy;
+});
+window.addEventListener('mousemove', e => {
+  if(!isDraggingImg) return;
+  imgTx = e.clientX - startX;
+  imgTy = e.clientY - startY;
+  updateImgTransform();
+});
+window.addEventListener('mouseup', () => isDraggingImg = false);
+
+// Touch Zoom/Pan logic (mobile)
+document.getElementById('img-modal-wrap').addEventListener('touchstart', e => {
+  if(e.touches.length === 1) {
+    isDraggingImg = true;
+    startX = e.touches[0].clientX - imgTx;
+    startY = e.touches[0].clientY - imgTy;
+  } else if(e.touches.length === 2) {
+    isDraggingImg = false;
+    initialPinchDistance = Math.hypot(e.touches[0].clientX - e.touches[1].clientX, e.touches[0].clientY - e.touches[1].clientY);
+    initialScale = imgScale;
+  }
+});
+document.getElementById('img-modal-wrap').addEventListener('touchmove', e => {
+  if(e.touches.length === 1 && isDraggingImg) {
+    imgTx = e.touches[0].clientX - startX;
+    imgTy = e.touches[0].clientY - startY;
+    updateImgTransform();
+  } else if(e.touches.length === 2) {
+    e.preventDefault();
+    const currentDistance = Math.hypot(e.touches[0].clientX - e.touches[1].clientX, e.touches[0].clientY - e.touches[1].clientY);
+    imgScale = Math.max(0.5, initialScale * (currentDistance / initialPinchDistance));
+    updateImgTransform();
+  }
+}, {passive: false});
+document.getElementById('img-modal-wrap').addEventListener('touchend', () => { isDraggingImg = false; initialPinchDistance = null; });
+
+
+// Renders collected YT videos as a thumbnail gallery into convBody
+function renderYTGallery(convBody,ytVideos){
+  if(!ytVideos.length)return;
+  const hdr=document.createElement('div');hdr.className='yt-gallery-hdr';
+  hdr.innerHTML=`<svg viewBox="0 0 16 16" fill="none" stroke-width="1.5"><rect x="1" y="3" width="14" height="10" rx="2"/><polygon points="6.5,6 10.5,8 6.5,10" fill="var(--red)" stroke="none"/></svg>${ytVideos.length} Video${ytVideos.length===1?'':'s'} Found`;
+  convBody.appendChild(hdr);
+  const grid=document.createElement('div');grid.className='yt-gallery';
+  ytVideos.forEach(({id,title})=>{
+    const thumb=document.createElement('div');thumb.className='yt-thumb';
+    thumb.title=title||'';
+    // YouTube's hqdefault thumbnail — always exists, no API key needed
+    thumb.innerHTML=`<img src="https://img.youtube.com/vi/${esc(id)}/hqdefault.jpg" alt="${esc(title)}" loading="lazy" onerror="this.style.display='none'">
+    <div class="yt-thumb-play"><svg viewBox="0 0 48 48" fill="none"><circle cx="24" cy="24" r="23" fill="rgba(0,0,0,.55)"/><polygon points="19,15 37,24 19,33" fill="#fff"/></svg></div>
+    <div class="yt-thumb-title">${esc(title||id)}</div>`;
+    thumb.onclick=()=>openYTModal(id,title);
+    grid.appendChild(thumb);
+  });
+  convBody.appendChild(grid);
+  scrollBottom();
+}
+
+
+const bm25=new BM25();
+const markov=new CosineSynth();
+const kg=new KnowledgeGraph();
+const ingester=new Ingester();
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+
+// ── BRAIN SAVE / LOAD ──────────────────────────────────────────────
+// Exports the full session memory (KG triples + BM25 corpus + Markov sentences)
+// as a downloadable JSON file that can be re-imported in a future session.
+function saveBrain(){
+  const payload={
+    v:2,
+    ts:new Date().toISOString(),
+                                                                                                                                                                        label:`Ruminance brain · ${bm25.docs.length} nodes · ${kg.triples.length} triples`,
+                                                                                                                                                                        kg:kg.exportBrain(),
+                                                                                                                                                                        bm25docs:bm25.docs.map(d=>({text:d.text,src:d.src})),
+                                                                                                                                                                        markovSents:markov.sentences.map(s=>s.text),
+  };
+  const blob=new Blob([JSON.stringify(payload,null,2)],{type:'application/json'});
+  const url=URL.createObjectURL(blob);
+  const a=document.createElement('a');
+  const stamp=new Date().toISOString().slice(0,16).replace('T','_').replace(':','-');
+  a.href=url;a.download=`ruminance_brain_${stamp}.json`;
+  document.body.appendChild(a);a.click();
+  setTimeout(()=>{URL.revokeObjectURL(url);a.remove();},1000);
+  addMsg(`Brain saved — ${kg.triples.length} triples, ${bm25.docs.length} nodes, ${markov.sentences.length} sentences.`,'i','Brain');
+}
+
+function loadBrainFile(){
+  const inp=document.createElement('input');
+  inp.type='file';inp.accept='.json';
+  inp.onchange=async()=>{
+    const file=inp.files[0];if(!file)return;
+    try{
+      const raw=await file.text();
+      const payload=JSON.parse(raw);
+      if(!payload.v||!payload.kg)throw new Error('Not a valid Ruminance brain file');
+      // Import KG
+      const{added,boosted}=kg.importBrain(payload.kg);
+      // Import BM25 docs
+      let docsAdded=0;
+      for(const d of(payload.bm25docs||[])){
+        if(bm25.addDoc(d.text,d.src||'brain')){markov.train(d.text);docsAdded++;}}
+        // Import additional Markov sentences not already covered by BM25
+        for(const s of(payload.markovSents||[])){
+          if(!markov.sentences.some(x=>x.text===s))markov.sentences.push({text:s});}
+          markov._dirty=true;
+          updateStats();
+          addMsg(`Brain loaded from "${file.name}"\n✓ ${added} new KG triples · ${boosted} confidence boosts · ${docsAdded} BM25 nodes added`,'i','Brain');
+    }catch(err){
+      addMsg(`Brain load failed: ${err.message}`,'e');
+    }
+    inp.remove();
+  };
+  document.body.appendChild(inp);inp.click();
+}
+
+async function handleQuery(q){
+  if(busy||!q.trim())return;
+
+  // ── /clear ────────────────────────────────────────────────────────
+  if(q.trim().toLowerCase()==='/clear'){
+    $('inp').value='';autoResize($('inp'));
+    mi().innerHTML='';
+    bm25.docs.length=0;bm25.df={};bm25._avgdl=0;bm25.vocabSz=0;
+    const hero=$('hero');if(hero){hero.style.display='';hero.classList.remove('hidden');}
+    updateStats();setStatus('Ready');setHl('L3');
+    dot('d-bm25','on');dot('d-mkv','on');dot('d-l3','on');dot('d-wiki','');dot('d-ddg','');dot('d-prx','');dot('d-cse','');
+    return;
+  }
+
+  // ── /help ────────────────────────────────────────────────────────
+  if(q.trim().toLowerCase()==='/help'){
+    $('inp').value='';autoResize($('inp'));
+    addMsg(q,'u','You');
+    const helpMsg = `**Available Commands:**
+    /clear - Clear the chat UI and reset BM25 index
+    /reset - Hard reset (clears chat, BM25, Knowledge Graph, and Markov data)
+    /stats - View current corpus statistics
+    /debug - Toggle the debug panel
+    /upload - Open the file upload dialog
+    /theme [dark|light|neon] - Change the application theme
+    /search [query] - Run a direct local BM25 search
+    /image [query] - Search the web for images`;
+    addMsg(helpMsg,'i','System');
+    return;
+  }
+
+  // ── /reset ───────────────────────────────────────────────────────
+  if(q.trim().toLowerCase()==='/reset'){
+    $('inp').value='';autoResize($('inp'));
+    mi().innerHTML='';
+    bm25.docs.length=0;bm25.df={};bm25._avgdl=0;bm25.vocabSz=0;
+    kg.triples.length=0;kg.conceptIdx={};kg.topicWords={};kg.adjTracker=new AdjTracker();
+    markov.sentences.length=0;markov.docCount=0;markov.idf={};
+    const hero=$('hero');if(hero){hero.style.display='';hero.classList.remove('hidden');}
+    updateStats();setStatus('Ready');setHl('L3');
+    dot('d-bm25','on');dot('d-mkv','on');dot('d-l3','on');dot('d-wiki','');dot('d-ddg','');dot('d-prx','');dot('d-cse','');
+    addMsg('Brain completely wiped. Knowledge graph and corpus cleared.','i','System');
+    return;
+  }
+
+  // ── /stats ───────────────────────────────────────────────────────
+  if(q.trim().toLowerCase()==='/stats'){
+    $('inp').value='';autoResize($('inp'));
+    addMsg(q,'u','You');
+    const statsMsg = `**Current Brain Stats:**
+    - BM25 Nodes: ${bm25.docs.length}
+    - Vocabulary Size: ${bm25.vocabSz}
+    - KG Triples: ${kg.triples.length}
+    - Markov Sentences: ${markov.sentences.length}`;
+    addMsg(statsMsg,'i','System');
+    return;
+  }
+
+  // ── /debug ───────────────────────────────────────────────────────
+  if(q.trim().toLowerCase()==='/debug'){
+    $('inp').value='';autoResize($('inp'));
+    toggleDbg();
+    addMsg('/debug (Toggled Panel)','u','You');
+    return;
+  }
+
+  // ── /upload ──────────────────────────────────────────────────────
+  if(q.trim().toLowerCase()==='/upload'){
+    $('inp').value='';autoResize($('inp'));
+    $('file-inp').click();
+    addMsg('/upload (Opened dialog)','u','You');
+    return;
+  }
+
+  // ── /theme [theme] ───────────────────────────────────────────────
+  const themeMatch=q.trim().match(/^\/theme\s+(.+)$/i);
+  if(themeMatch){
+    document.getElementById('inp').value='';autoResize(document.getElementById('inp'));
+    const t = themeMatch[1].toLowerCase().trim();
+    addMsg(q,'u','You');
+    const root = document.documentElement;
+    root.classList.remove('theme-light', 'theme-neon');
+    if(t==='light'){
+      root.classList.add('theme-light');
+      root.style.setProperty('--bg','#f9fafb');
+      root.style.setProperty('--bg2','#ffffff');
+      root.style.setProperty('--bg3','#f3f4f6');
+      root.style.setProperty('--border','#e5e7eb');
+      root.style.setProperty('--border2','#d1d5db');
+      root.style.setProperty('--text','#111827');
+      root.style.setProperty('--text2','#374151');
+      root.style.setProperty('--text3','#6b7280');
+      addMsg('Switched to light theme.','i','System');
+    } else if(t==='neon'){
+      root.classList.add('theme-neon');
+      root.style.setProperty('--bg','#09090b');
+      root.style.setProperty('--bg2','#18181b');
+      root.style.setProperty('--bg3','#27272a');
+      root.style.setProperty('--border','#3f3f46');
+      root.style.setProperty('--border2','#52525b');
+      root.style.setProperty('--text','#c0caf5');
+      root.style.setProperty('--text2','#a9b1d6');
+      root.style.setProperty('--text3','#565f89');
+      root.style.setProperty('--orange','#ff007c');
+      root.style.setProperty('--green','#00ff9d');
+      root.style.setProperty('--blue','#0db9d7');
+      addMsg('Switched to neon theme.','i','System');
+    } else {
+      root.style.removeProperty('--bg');
+      root.style.removeProperty('--bg2');
+      root.style.removeProperty('--bg3');
+      root.style.removeProperty('--border');
+      root.style.removeProperty('--border2');
+      root.style.removeProperty('--text');
+      root.style.removeProperty('--text2');
+      root.style.removeProperty('--text3');
+      root.style.removeProperty('--orange');
+      root.style.removeProperty('--green');
+      root.style.removeProperty('--blue');
+      addMsg('Switched to default dark theme.','i','System');
+    }
+    return;
+  }
+
+  // ── /search [query] ──────────────────────────────────────────────
+  const searchMatch=q.trim().match(/^\/search\s+(.+)$/i);
+  if(searchMatch){
+    $('inp').value='';autoResize($('inp'));
+    const sq = searchMatch[1].trim();
+    addMsg(q,'u','You');
+    if(bm25.docs.length===0){
+      addMsg('Cannot search. The local corpus is empty. Upload some files first.','e','System');
+      return;
+    }
+    const res = bm25.query(sq, 3);
+    if(res.results.length===0){
+      addMsg(`No local results found for "${sq}".`,'i','System');
+    } else {
+      const conv = createConvStream();
+      conv.addPara(`**Top 3 Local Search Results for "${sq}":**`);
+      res.results.forEach((r, idx)=>{
+        conv.addPara(`**[Result ${idx+1} | Score: ${r.score.toFixed(2)}]**\n${r.d.text}`,'muted');
+      });
+    }
+    return;
+  }
+
+  // ── /image {query} ────────────────────────────────────────────────
+  const imgMatch=q.trim().match(/^\/image\s+(.+)$/i);
+  if(imgMatch){
+    $('inp').value='';autoResize($('inp'));
+    const imgQ=imgMatch[1].trim();
+    busy=true;$('send-btn').disabled=true;
+    const hero=$('hero');
+    if(hero&&!hero.classList.contains('hidden')){hero.classList.add('hidden');setTimeout(()=>{hero.style.display='none';},420);}
+    addMsg(`/image ${imgQ}`,'u','You');
+    const conv=createConvStream();
+    await conv.addPara(`Searching for images of "${imgQ}" across Wikimedia, Wikipedia, and the open web…`);
+    setStatus('Fetching images…');dot('d-prx','bz');
+
+    const allImgs=[];const seenUrls=new Set();
+    function addImg(url,caption,source){
+      if(!url||seenUrls.has(url))return;
+      if(/(logo|icon|flag|seal|arrow|edit|sprite|pixel|tracking|1x1|svg.*\?|\.svg$)/i.test(url))return;
+      seenUrls.add(url);
+      allImgs.push({url,caption:(caption||'').replace(/<[^>]+>/g,'').trim().slice(0,100),source});
+    }
+
+    // Source 1: Wikimedia Commons file search (CORS)
+    try{
+      const e=encodeURIComponent;
+      const r=await fetch(`https://commons.wikimedia.org/w/api.php?action=query&generator=search&gsrsearch=${e(imgQ)}&gsrnamespace=6&gsrlimit=20&prop=imageinfo&iiprop=url|thumburl|extmetadata&iiurlwidth=500&format=json&origin=*`);
+      if(r.ok){const d=await r.json();Object.values(d.query?.pages||{}).forEach(p=>{const info=p.imageinfo?.[0];if(!info)return;const url=info.thumburl||info.url||'';if(!url.startsWith('http'))return;const cap=(info.extmetadata?.ImageDescription?.value||p.title||'').replace(/<[^>]+>/g,'').trim();addImg(url,cap,'Wikimedia');});}
+    }catch(_){}
+
+    // Source 2: Wikipedia article images (CORS)
+    try{
+      const e=encodeURIComponent;
+      const sr=await fetch(`https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=${e(imgQ)}&format=json&origin=*&srlimit=3`);
+      if(sr.ok){
+        const sd=await sr.json();
+        for(const hit of(sd.query?.search||[]).slice(0,3)){
+          const ir=await fetch(`https://en.wikipedia.org/w/api.php?action=query&titles=${e(hit.title)}&prop=images&format=json&origin=*&imlimit=8`);
+          if(!ir.ok)continue;
+          const id=await ir.json();const pg=Object.values(id.query?.pages||{})[0];
+          const imgTitles=(pg?.images||[]).filter(img=>!/(logo|icon|flag|seal|arrow|edit|button|commons|svg)/i.test(img.title)).slice(0,6);
+          for(const img of imgTitles){
+            try{const ui=await fetch(`https://en.wikipedia.org/w/api.php?action=query&titles=${e(img.title)}&prop=imageinfo&iiprop=url|thumburl&iiurlwidth=500&format=json&origin=*`);
+            if(!ui.ok)continue;const ud=await ui.json();const p2=Object.values(ud.query?.pages||{})[0];const info=p2?.imageinfo?.[0];
+            if(info){addImg(info.thumburl||info.url,img.title.replace('File:','').replace(/\.[^.]+$/,''),'Wikipedia');}}catch(_){}
+          }
+        }
+      }
+    }catch(_){}
+
+    // Source 3: Proxy scrape Bing Images HTML for extra variety
+    try{
+      const e=encodeURIComponent;
+      const html=await window.__proxyBridge.fetch(`https://www.bing.com/images/search?q=${e(imgQ)}&form=HDRSC2&first=1`,12000);
+      const doc=new DOMParser().parseFromString(html,'text/html');
+      doc.querySelectorAll('img[src],img[data-src]').forEach(img=>{
+        let src=(img.getAttribute('src')||img.getAttribute('data-src')||'').trim();
+        const alt=(img.getAttribute('alt')||'').trim();
+        if(!src.startsWith('http')||/(logo|icon|gstatic|bing\.com|msn\.com|microsoft|tse\d)/i.test(src))return;
+        addImg(src,alt||imgQ,'Web');
+      });
+      // Also parse JSON blobs embedded in script tags
+      doc.querySelectorAll('script').forEach(s=>{
+        const matches=s.textContent.match(/"murl"\s*:\s*"([^"]+)"/g)||[];
+        matches.forEach(m=>{const u=m.match(/"murl"\s*:\s*"([^"]+)"/)?.[1];if(u&&u.startsWith('http'))addImg(u,imgQ,'Bing');});
+      });
+    }catch(_){}
+
+    // Source 4: DuckDuckGo image vqd+SERP via proxy
+    try{
+      const e=encodeURIComponent;
+      const html=await window.__proxyBridge.fetch(`https://html.duckduckgo.com/html/?q=${e(imgQ)}+site:commons.wikimedia.org`,10000);
+      const doc=new DOMParser().parseFromString(html,'text/html');
+      doc.querySelectorAll('a.result__a[href]').forEach(a=>{
+        const href=a.getAttribute('href')||'';
+        if(/commons\.wikimedia\.org\/wiki\/File:/i.test(href)){
+          // Try to extract a predictable thumb URL from Commons filename
+          const fn=decodeURIComponent(href.split('File:')[1]||'').replace(/\s/g,'_');
+          if(fn)addImg(`https://commons.wikimedia.org/wiki/Special:FilePath/${encodeURIComponent(fn)}?width=400`,(a.textContent||fn).trim(),'Commons');
+        }
+      });
+    }catch(_){}
+
+    // Source 5: Google CSE image tab via relay
+    try{
+      await conv.addPara(`Also checking Google Images…`,'muted',true);
+      const cseImgs=await new Promise((resolve)=>{
+        const RELAY='https://roarx-dev.github.io/DESERT-RAFT/';
+        let settled=false;
+        const timer=setTimeout(()=>{if(!settled){settled=true;cleanup();resolve([]);}},22000);
+        const iframe=document.createElement('iframe');
+        iframe.style.cssText='position:fixed;width:1px;height:1px;opacity:0;pointer-events:none;top:-9999px;left:-9999px;border:none;';
+        iframe.src=`${RELAY}?q=${encodeURIComponent(imgQ)}`;
+        document.body.appendChild(iframe);
+        function cleanup(){try{document.body.removeChild(iframe);}catch(_){}window.removeEventListener('message',onMsg);clearTimeout(timer);}
+        function onMsg(ev){
+          if(!ev.origin.includes('github.io'))return;
+          const d=ev.data;
+          if(!d||d.type!=='cse-results')return;
+          if(settled)return;
+          settled=true;cleanup();
+          resolve((d.images||[]).filter(im=>im&&im.url&&im.url.startsWith('http')));
+        }
+        window.addEventListener('message',onMsg);
+      });
+      cseImgs.forEach(im=>addImg(im.url,im.caption||imgQ,'Google'));
+    }catch(_){}
+
+    // Render
+    dot('d-prx',allImgs.length?'on':'er');setStatus('Ready');
+    const totalFound=allImgs.length;
+    await conv.addPara(totalFound>0?`Found ${totalFound} image${totalFound===1?'':'s'} for "${imgQ}" — click any to open full size.`:`Couldn't find images for "${imgQ}" this time — try a different search term.`,'muted',true);
+
+    if(totalFound>0){
+      const gridWrap=document.createElement('div');
+      const hdr=document.createElement('div');hdr.className='img-search-header';hdr.textContent=`${totalFound} Images · "${imgQ}"`;
+      gridWrap.appendChild(hdr);
+      const grid=document.createElement('div');grid.className='img-search-grid';
+      allImgs.forEach(im=>{
+        const item=document.createElement('div');item.className='img-search-item';
+        item.innerHTML=`<img src="${esc(im.url)}" alt="${esc(im.caption)}" loading="lazy" onerror="this.closest('.img-search-item').style.display='none'">
+        <div class="img-search-caption">${esc(im.caption||im.source)}</div>
+        <div class="img-search-src">${esc(im.source)}</div>`;
+        item.onclick=()=>openImgModal(im.url);
+        grid.appendChild(item);
+      });
+      gridWrap.appendChild(grid);
+      conv._body.appendChild(gridWrap);scrollBottom();
+    }
+
+    busy=false;$('send-btn').disabled=false;$('inp').focus();
+    return;
+  }
+
+  busy=true;$('inp').value='';autoResize($('inp'));$('send-btn').disabled=true;
+
+  const hero=$('hero');
+  if(hero&&!hero.classList.contains('hidden')){hero.classList.add('hidden');setTimeout(()=>{hero.style.display='none';},420);}
+
+  addMsg(q,'u','You');
+
+  // ── Parse query with god-tier NLP ────────────────────────────────
+  const _qParsed=QueryParser.parse(q);
+  const _searchStr=_qParsed.searchStr||q;
+  const _intent=_qParsed.intent;
+
+  // Intent-aware intro text
+  const _intentIntros={
+    'define':`Looking up the definition and key facts about "${_searchStr}"…`,
+    'compare':`Comparing ${(_qParsed.intent.entities||[]).join(' and ')||_searchStr}…`,
+                                                                                                                                                                        'mechanism':`Investigating how ${_searchStr} works…`,
+                                                                                                                                                                        'history':`Researching the history and origins of "${_searchStr}"…`,
+                                                                                                                                                                        'causal':`Exploring causes and effects related to "${_searchStr}"…`,
+                                                                                                                                                                        'list':`Finding examples and types of "${_searchStr}"…`,
+                                                                                                                                                                        'person':`Looking up information on "${_searchStr}"…`,
+                                                                                                                                                                        'location':`Finding geographical information about "${_searchStr}"…`,
+                                                                                                                                                                        'quantitative':`Gathering statistics and data on "${q.length>60?q.slice(0,60)+'…':q}"…`,
+                                                                                                                                                                        'info':`Got it — looking into "${q.length>60?q.slice(0,60)+'…':q}" now. Organising useful information from the web, setting up plan for further reading.`,
+  };
+  const _introText=_intentIntros[_intent.id]||_intentIntros['info'];
+
+  // Spell correction notice
+  const _correctionNote=(_qParsed.corrected&&_qParsed.corrected!==_qParsed.normalized)
+  ? ` *(interpreted as: "${_qParsed.corrected}")*` : '';
+
+  const conv=createConvStream();
+  // Intro typed word by word
+  await conv.addPara(_introText+_correctionNote);
+
+  // ── Wikipedia widget ──────────────────────────────────────────────
+  await conv.addPara('Looking for relevant articles on wikipedia, synthesising results.</br>Now, reading in detail.','muted',true);
+  const wikiPhase=conv.addThinkPhase('wiki','Wikipedia','📖','REST API');
+  const wStep1=wikiPhase.addThinkStep('Sending query to Wikipedia search');
+  await sleep(400);
+  const wStep2=wikiPhase.addThinkStep('Picking the top result title');
+  await sleep(350);
+  const wStep3=wikiPhase.addThinkStep('Reading the full article — every section');
+  await sleep(300);
+  const wStep4=wikiPhase.addThinkStep('Looking up available images');
+  await sleep(250);
+  const wStep5=wikiPhase.addThinkStep('Fetching image thumbnails and captions');
+  await sleep(200);
+  const wStep6=wikiPhase.addThinkStep('Collecting linked topics for the suggest panel');
+
+  // ── DuckDuckGo widget ─────────────────────────────────────────────
+  await conv.addPara('Done, now requesting results from DDG for further refernece.</br>Adjusting relevance, finding the best results.','muted',true);
+  const ddgPhase=conv.addThinkPhase('ddg','DuckDuckGo','🦆','Instant Answers API');
+  const dStep1=ddgPhase.addThinkStep('Querying DuckDuckGo instant answers');
+  await sleep(300);
+  const dStep2=ddgPhase.addThinkStep('Reading abstract and definition fields');
+  await sleep(300);
+  const dStep3=ddgPhase.addThinkStep('Organising related topics');
+  await sleep(250);
+  const dStep4=ddgPhase.addThinkStep('Checking for an article image');
+  await sleep(200);
+  const dStep5=ddgPhase.addThinkStep('Mapping related topics to suggestions');
+
+  // ── Proxy / Britannica widget ─────────────────────────────────────
+  await conv.addPara('Now going deeper, assimilating various articles.</br>Checking context, linking appropriate content.</br>Cleaning content and feeding the corpus.Good, now continue for further research.','muted',true);
+  const proxyPhase=conv.addThinkPhase('proxy','Deep Reading','🌐','Britannica + Wikipedia Mobile');
+  const pStep1=proxyPhase.addThinkStep('Trying Britannica autosuggest');
+  await sleep(350);
+  const pStep2=proxyPhase.addThinkStep('Falling back to Britannica HTML search if needed');
+  await sleep(300);
+  const pStep3=proxyPhase.addThinkStep('Trying Wikipedia Mobile as secondary source');
+  await sleep(250);
+  const pStep4=proxyPhase.addThinkStep('Checking DuckDuckGo HTML for extra links');
+  await sleep(250);
+  const pStep5=proxyPhase.addThinkStep('Scoring links by query relevance');
+  await sleep(200);
+  const pStep6=proxyPhase.addThinkStep('Reading top-ranked articles through proxy');
+  await sleep(200);
+  const pStep7=proxyPhase.addThinkStep('Pulling subtopics and images, removing nav clutter');
+  await sleep(200);
+  const pStep8=proxyPhase.addThinkStep('Checking for duplicate articles and merging');
+
+  // ── Google CSE widget ─────────────────────────────────────────────
+  await conv.addPara('Also running a Google Custom Search to find anything these sources might have missed.</br>Retrying to fetch relevant results.','muted',true);
+  const csePhase=conv.addThinkPhase('proxy','Google Custom Search','🔎','CSE cx=6580aa8b33a2748cb');
+  const cStep1=csePhase.addThinkStep('Loading Google CSE in sandboxed iframe');
+  await sleep(300);
+  const cStep2=csePhase.addThinkStep('Waiting for CSE results to render');
+  await sleep(250);
+  const cStep3=csePhase.addThinkStep('Reading result links and images from CSE DOM');
+
+  try{
+    setStatus('Fetching…');
+
+    // Fire CSE in parallel with main ingestion
+    let cseResult=null;
+    const csePromise=ingester.fetchCSE(q).then(r=>{
+      cseResult=r;
+      csePhase.finishThinkStep(cStep1,'CSE loaded and search executed','',false);
+      csePhase.finishThinkStep(cStep2,`Got ${r.links.length} result${r.links.length===1?'':'s'} from Google CSE`,'',false);
+      csePhase.finishThinkStep(cStep3,r.images.length>0?`${r.images.length} image${r.images.length===1?'':'s'} collected`:'No images from CSE this time','',false);
+      csePhase.finishWidget(false);
+    }).catch(()=>{
+      [cStep1,cStep2,cStep3].forEach(s=>csePhase.finishThinkStep(s,'Not available this time','',true));
+      csePhase.finishWidget(true);
+    });
+
+    // Track per-source step references
+    let wikiStepActive=wStep3, ddgStepActive=dStep2, proxyStepActive=pStep1;
+
+    const ing=await ingester.ingest(q,{
+      addStep:(icon,text,sub)=>{
+        if(/wiki/i.test(text))return {el:'wiki'};
+        if(/ddg|duck/i.test(text))return {el:'ddg'};
+        return {el:'proxy'};
+      },
+      updateStep:(elRef,icon,text,sub)=>{
+        let friendly=text;
+        if(/searching/i.test(text))friendly=`Searching ${text.replace(/searching/i,'').replace(/…/,'').trim()} for relevant articles`;
+        else if(/ranking/i.test(text))friendly=`Found candidate links — sorting by relevance`;
+        else if(/scraping article/i.test(text))friendly=text.replace(/scraping article/i,'Reading article');
+        else if(/deduplicating/i.test(text))friendly=`Checking for overlapping content across ${text.match(/\d+/)?.[0]||''} articles`;
+
+        if(elRef?.el==='wiki'){wikiPhase.updateThinkStep(wikiStepActive,friendly,sub,'live');}
+        else if(elRef?.el==='ddg'){ddgPhase.updateThinkStep(ddgStepActive,friendly,sub,'live');}
+        else{proxyPhase.updateThinkStep(proxyStepActive,friendly,sub,'live');}
+      },
+      finishStep:(elRef,icon,text,sub,fail)=>{
+        let friendly=text;
+        if(/wikipedia:/i.test(text))friendly=`Wikipedia — found "${text.replace(/wikipedia:\s*/i,'').trim()}"`;
+        else if(/duckduckgo:/i.test(text))friendly=`DuckDuckGo — got summary for "${text.replace(/duckduckgo:\s*/i,'').trim()}"`;
+        else if(/articles retrieved/i.test(text))friendly=`Done — read ${text.match(/\d+/)?.[0]||'several'} full articles`;
+        else if(/failed/i.test(text))friendly=text;
+
+        if(elRef?.el==='wiki'){
+          [wStep1,wStep2,wStep3,wStep4,wStep5,wStep6].forEach(s=>wikiPhase.finishThinkStep(s,fail?text:'✓ '+s.querySelector?.('.tl-main')?.textContent||'Done','',fail));
+          wikiPhase.finishThinkStep(wStep6,friendly,sub,fail);
+        } else if(elRef?.el==='ddg'){
+          [dStep1,dStep2,dStep3,dStep4,dStep5].forEach(s=>ddgPhase.finishThinkStep(s,'✓ Complete','',false));
+          ddgPhase.finishThinkStep(dStep5,friendly,sub,fail);
+        } else {
+          [pStep1,pStep2,pStep3,pStep4,pStep5,pStep6,pStep7,pStep8].forEach(s=>proxyPhase.finishThinkStep(s,'✓ Complete','',false));
+          proxyPhase.finishThinkStep(pStep8,friendly,sub,fail);
+        }
+      }
+    },_searchStr);
+
+    // Mark all pending steps as done after fetch completes
+    await sleep(300);
+    [wStep1,wStep2,wStep3,wStep4,wStep5,wStep6].forEach(s=>{if(s.classList.contains('live'))wikiPhase.finishThinkStep(s,'Complete','',false);});
+    wikiPhase.finishWidget(false);
+    [dStep1,dStep2,dStep3,dStep4,dStep5].forEach(s=>{if(s.classList.contains('live'))ddgPhase.finishThinkStep(s,'Complete','',false);});
+    ddgPhase.finishWidget(false);
+    [pStep1,pStep2,pStep3,pStep4,pStep5,pStep6,pStep7,pStep8].forEach(s=>{if(s.classList.contains('live'))proxyPhase.finishThinkStep(s,'Complete','',false);});
+    proxyPhase.finishWidget(false);
+    await conv.addPara(`Done reading. Got ${ing.pages||0} article${ing.pages===1?'':'s'} across ${ing.groups||1} source group${ing.groups===1?'':'s'}. Now I'll organise and rank everything by relevance to your query.`);
+
+    // ── Indexing widget ────────────────────────────────────────────
+    await conv.addPara('Indexing everything I just read — breaking it into sentences, scoring each one against your query with BM25.','muted',true);
+    const idxPhase=conv.addThinkPhase('index','Indexing & Ranking','🔍','BM25 + Cosine MMR synthesis');
+    await sleep(2000);
+    const iStep1=idxPhase.addThinkStep('Breaking the retrieved text into individual sentences');
+    await sleep(400);
+    const iStep2=idxPhase.addThinkStep('Filtering out common words — focusing on what actually matters');
+    await sleep(350);
+    const iStep3=idxPhase.addThinkStep('Counting how often each meaningful term appears in each sentence');
+    await sleep(300);
+    const iStep4=idxPhase.addThinkStep('Building a term index so I know which sentences contain what');
+    await sleep(300);
+    const iStep5=idxPhase.addThinkStep('Running BM25 scoring — ranking every passage by relevance to your query');
+    await sleep(350);
+
+    if(ing.text&&ing.text.length>80){
+      // Multi-pass sentence extraction (same pipeline as processText)
+      const rawText=ing.text;
+      const p1=rawText.match(/[^.!?\n]{20,}[.!?]+/g)||[];
+      const p2=rawText.split(/;\s+/).filter(l=>l.trim().length>35);
+      const allSents=[...p1,...(p1.length<5?p2:[])];
+      const seenSents=new Set();
+      let added=0;
+      allSents.slice(0,150).forEach(s=>{
+        // Space recovery: camelCase boundary insertion
+        const c=s.trim()
+        .replace(/\[\d+\]/g,'').replace(/\[.*?\]/g,'')
+        .replace(/([a-z])([A-Z])/g,'$1 $2')
+        .replace(/([A-Z]+)([A-Z][a-z])/g,'$1 $2')
+        .replace(/\s+/g,' ').trim();
+        if(c.length<=35)return;
+        // Skip nav/header noise
+        if(/^(see also|references|external links|further reading|notes|bibliography|contents|navigation|advertisement|subscribe|sign in|log in|cookie)/i.test(c))return;
+        const key=c.toLowerCase().slice(0,60);
+        if(seenSents.has(key))return;
+        seenSents.add(key);
+        if(bm25.addDoc(c,`${ing.layer}:${(ing.title||'').slice(0,16)}`)){markov.train(c);kg.learn(c,ing.layer);added++;}
+      });
+      // Also feed rawPages (scraped articles) if present — these are currently skipped
+      if(ing.rawPages&&ing.rawPages.length>0){
+        for(const page of ing.rawPages){
+          if(!page.text||page.text.length<100)continue;
+          const pgSents=page.text.match(/[^.!?\n]{20,}[.!?]+/g)||[];
+          pgSents.slice(0,80).forEach(s=>{
+            const c=s.trim()
+            .replace(/([a-z])([A-Z])/g,'$1 $2')
+            .replace(/\s+/g,' ').trim();
+            if(c.length<=35)return;
+            if(/^(see also|references|further reading|advertisement|subscribe|sign in)/i.test(c))return;
+            const key=c.toLowerCase().slice(0,60);
+            if(seenSents.has(key))return;
+            seenSents.add(key);
+            if(bm25.addDoc(c,`scrape:${(page.title||'').slice(0,16)}`)){markov.train(c);kg.learn(c,'scrape');added++;}
+          });
+        }
+      }
+      updateStats();
+      idxPhase.finishThinkStep(iStep5,`Scored ${bm25.docs.length} passages — ${added} new ones added · vocab now at ${bm25.vocabSz} terms`,'',false);
+    }else{
+      idxPhase.finishThinkStep(iStep5,`Using ${bm25.docs.length} passages already in corpus — no new material to index`,'',false);
+    }
+    [iStep1,iStep2,iStep3,iStep4].forEach(s=>idxPhase.finishThinkStep(s,'✓ Complete','',false));
+
+    const iStep6=idxPhase.addThinkStep('Pulling the top 7 passages — best match to your query at the top');
+    dot('d-bm25','bz');
+    const retrieved=bm25.query(q,7);
+    dot('d-bm25','on');
+    await sleep(300);
+    const topScore=(retrieved.results[0]?.score||0).toFixed(3);
+    const termList=retrieved.qterms.slice(0,5).join(', ');
+    idxPhase.finishThinkStep(iStep6,`Top relevance score: ${topScore} · key terms: [${termList}]`,'',false);
+
+    // Cosine MMR synthesis — target 300 words
+    const iStep7=idxPhase.addThinkStep('Synthesising a response from the highest-ranked passage using learned language patterns');
+    await sleep(2000);
+    dot('d-mkv','bz');
+    const anchorText=retrieved.results.filter(r=>r.score>0)[0]?.d.text||q;
+    const anchorToks=anchorText.split(/\s+/).filter(w=>w.length>3).slice(0,10);
+    const markovGen=markov.gen(anchorText,anchorToks,300,kg);// cosine MMR + concept-coherence
+    dot('d-mkv','on');
+    idxPhase.finishThinkStep(iStep7,`Synthesis ready — ${markovGen.paragraphs?.length||0} paragraphs · ${markovGen.txt.split(/\s+/).filter(Boolean).length} words · top cos ${markovGen.topScore?.toFixed(3)||'—'}`,'',false);
+    idxPhase.finishWidget(false);
+    await conv.addPara('Indexing done. Here is what I found — I\'ll show the full articles first, then a ranked summary at the bottom.');
+
+    setStatus('Rendering…');
+    await sleep(200);
+
+    // Wait for CSE to finish and merge images
+    await csePromise;
+    if(cseResult?.links?.length>0){
+      await conv.addPara(`Google Custom Search found ${cseResult.links.length} additional result${cseResult.links.length===1?'':'s'}. I'll show those at the bottom after the main articles.`,'muted',true);
+    }
+    // FIX 1: Merge CSE images into rawPages[0] if available, otherwise keep them separately
+    const cseImages=cseResult?.images||[];
+    if(cseImages.length&&ing.rawPages&&ing.rawPages[0]){
+      ing.rawPages[0].images=[...(ing.rawPages[0].images||[]),...cseImages].slice(0,50);
+    }
+
+    // Full articles inline
+    if(ing.rawPages&&ing.rawPages.length){
+      const n=ing.rawPages.length;
+      await conv.addPara(n===1?`Here is the full article I retrieved.`:`Here are the ${n} full articles I retrieved.`);
+      // Attach images from top-level fetch to first page if that page has no images
+      if(ing.images&&ing.images.length&&ing.rawPages[0]&&!ing.rawPages[0].images?.length){
+        ing.rawPages[0].images=ing.images;
+      }
+      ing.rawPages.forEach((p,i)=>conv.addArticle(p,i,n,ing.sourceName||'L2'));
+    }
+
+    // Show CSE additional links if we got any
+    // FIX 2: use conv._body instead of bare `body` which is out of scope here
+    if(cseResult?.links?.length>0){
+      const cseLinksDiv=document.createElement('div');
+      cseLinksDiv.style.cssText='margin:8px 0 16px;display:flex;flex-direction:column;gap:5px;';
+      cseResult.links.slice(0,6).forEach(l=>{ //displaying only 6 to avoid over-crowding
+        const a=document.createElement('a');
+        a.href=l.href;a.target='_blank';a.rel='noopener';
+        a.style.cssText='font-size:12.5px;color:var(--blue);text-decoration:none;display:flex;align-items:center;gap:6px;padding:4px 0;border-bottom:1px solid var(--border);opacity:.85;';
+        a.innerHTML=`<svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M4 2H2a1 1 0 0 0-1 1v5a1 1 0 0 0 1 1h5a1 1 0 0 0 1-1V6M6 1h3m0 0v3m0-3L4.5 5.5"/></svg>${esc(l.text.slice(0,80))}`;
+        a.onmouseover=()=>a.style.opacity='1';
+        a.onmouseout=()=>a.style.opacity='.85';
+        cseLinksDiv.appendChild(a);
+      });
+      conv._body.appendChild(cseLinksDiv);
+      scrollBottom();
+    }
+
+    // ── ADVANCED MODE: scrape all CSE links + YouTube gallery ─────────
+    if(advMode && cseResult?.links?.length>0){
+      const advPhase=conv.addThinkPhase('proxy','Advanced Scrape','⚡',`Scraping ${cseResult.links.length} CSE links`);
+      const advStep=advPhase.addThinkStep('Fetching full content from CSE result pages…');
+      await conv.addPara(`Advanced mode active — reading all ${cseResult.links.length} pages Google found. This takes a moment.`,'muted',true);
+
+      const seenYT=new Set();    // dedup by video ID
+      const ytVideos=[];         // [{id, title}] — rendered as gallery at end
+      const advPages=[];
+      const linksToScrape=cseResult.links.slice(0,25);
+
+      for(let i=0;i<linksToScrape.length;i++){
+        const lnk=linksToScrape[i];
+        advPhase.updateThinkStep(advStep,'','Reading '+lnk.text.slice(0,50)+'…','','live');
+
+        // Direct YouTube link — collect for gallery, skip scraping
+        const directYTId=extractYTId(lnk.href);
+        if(directYTId&&!seenYT.has(directYTId)){
+          seenYT.add(directYTId);
+          ytVideos.push({id:directYTId,title:lnk.text||'YouTube Video'});
+          continue;
+        }
+
+        // Skip non-scrapeable domains
+        if(/(twitter\.com|x\.com|instagram\.com|facebook\.com|tiktok\.com|reddit\.com\/r\/[^/]+\/?$)/i.test(lnk.href))continue;
+
+        try{
+          const rawHtml=await window.__proxyBridge.fetch(lnk.href,12000);
+          if(rawHtml.length<400)continue;
+
+          // Scan raw HTML text for YouTube URLs (catches embeds, links in script blobs)
+          const ytUrls=findYTUrlsInText(rawHtml);
+          ytUrls.forEach(ytUrl=>{
+            const ytId=extractYTId(ytUrl);
+            if(ytId&&!seenYT.has(ytId)){
+              seenYT.add(ytId);
+              ytVideos.push({id:ytId,title:lnk.text+' · video'});
+            }
+          });
+
+          // Parse DOM
+          const doc=new DOMParser().parseFromString(rawHtml,'text/html');
+          ['script','style','nav','footer','header','aside','form','noscript'].forEach(tag=>{
+            doc.querySelectorAll(tag).forEach(el=>el.remove());
+          });
+
+          // ── Space-preserving text extraction ─────────────────────
+          // textContent on DOMParser docs collapses spaces between inline
+          // elements — "French Chamber of Deputies" becomes
+          // "FrenchChamberofDeputies". We walk text nodes manually,
+          // inserting a space at every element boundary.
+          function extractSpaced(root){
+            const parts=[];
+            const BLOCK=new Set(['P','DIV','H1','H2','H3','H4','H5','H6','LI','TD','TH','TR','SECTION','ARTICLE','BLOCKQUOTE','PRE','BR','HR','DT','DD']);
+            function walk(node){
+              if(node.nodeType===3){// text node
+                const t=node.textContent;
+                if(t)parts.push(t);
+              } else if(node.nodeType===1){
+                const tag=node.tagName;
+                if(['SCRIPT','STYLE','NOSCRIPT','TEMPLATE'].includes(tag))return;
+                // Insert a space before block-level elements so inline content doesn't merge
+                if(BLOCK.has(tag))parts.push(' ');
+                for(const child of node.childNodes)walk(child);
+                if(BLOCK.has(tag))parts.push(' ');
+                else parts.push(' ');// space after every inline element too
+              }
+            }
+            walk(root);
+            return parts.join('');
+          }
+
+          // ── Spell-check space recovery ────────────────────────────
+          // Uses the browser's built-in spell-check dictionary (via a
+          // hidden contenteditable) to detect run-together words and
+          // try to split them at known word boundaries. Falls back to
+          // simple CamelCase / case-change heuristic.
+          function recoverSpaces(text){
+            // Step 1: CamelCase boundary insertion (fast, no DOM needed)
+            // "FrenchChamber" → "French Chamber", "frenchChamber" → "french Chamber"
+            let t=text
+            // Insert space before a capital that follows a lowercase (camelCase)
+            .replace(/([a-z])([A-Z])/g,'$1 $2')
+            // Insert space before a capital sequence followed by lowercase (ABCDef → ABC Def)
+            .replace(/([A-Z]+)([A-Z][a-z])/g,'$1 $2');
+
+            // Step 2: Long run-together lowercase words (like "frenchcamberofdeputs")
+            // Use a simple heuristic: if a token has no spaces and is > 14 chars,
+            // try to split it using known English word prefixes/suffixes.
+            // We use the browser textarea spellcheck as a signal if available.
+            t=t.replace(/\b([a-z]{15,})\b/g,(match)=>{
+              // Try to split at likely word boundaries using common short words
+              // that appear inside concatenated strings
+              return match
+              .replace(/(the|and|of|in|on|at|to|for|with|by|from|into|over|under|about|that|this|was|were|been|have|has|had|can|will|would|should|could|may|might|must|shall|is|are|be|do|does|did|not|but|or|nor|yet|so|if|as|up|out|new|old|one|two|three|four|five|six|seven|eight|nine|ten|its|his|her|our|your|their|which|when|where|who|how|why|than|then|more|most|some|any|all|each|both|such|very|just|also|even|only|now|here|there|too|same|other|first|last|long|great|little|own|right|high|next|early|young|important|large|public|private|real|best|free|few|new|good|old|right|small|large|national|american|political|economic|social|cultural|historical|international|european|military|natural|general|central|local|special|possible|different|following|various|major|main|certain|single|common|full|open|available|simple|complex|modern|traditional|ancient|current|recent|future|former|later|early|basic|similar|specific|particular|additional|several|important|significant|necessary|possible|available|required|related|based|used|known|called|made|given|taken|seen|done|come|become|turned|ended|started|began|continued|found|said|told|held|kept|set|put|run|brought|came|went|got|gave|knew|left|saw|stood|took|thought|wanted|needed|felt|looked|seemed|showed|heard|tried|asked|worked|moved|lived|played|called|turned|helped|followed|moved|faced|raised|placed|formed|created|developed|established|provided|included|required|produced|continued|increased|reduced|changed|improved|supported|caused|enabled|prevented|allowed|led|brought|gave|took|made|saw|heard|told|said|knew|found|felt|seemed|looked|appeared|remained|became|turned|started|ended|continued|began|stopped|opened|closed|moved|placed|left|returned|entered|reached|used|known|called|made|given|taken|seen|done)/gi,
+                       (w,offset)=>offset===0?w:' '+w);
+            });
+
+            // Step 3: Clean up multiple spaces
+            return t.replace(/[ \t]{2,}/g,' ').replace(/\n{3,}/g,'\n\n').trim();
+          }
+
+          const mainEl=doc.querySelector('article,main,[role="main"],.post-content,.entry-content,.article-body,.story-body,.content-body')||doc.body||doc.documentElement;
+          const rawText=extractSpaced(mainEl);
+          const cleaned=recoverSpaces(rawText).slice(0,8000);
+          if(cleaned.length<150)continue;
+
+          // Image extraction — resolve relative URLs properly
+          const imgs=[];
+          const seenImgUrls=new Set();
+          let pageOrigin='';
+          let pageBase='';
+          try{const pu=new URL(lnk.href);pageOrigin=pu.origin;pageBase=pu.origin+pu.pathname.replace(/[^/]+$/,'');}catch(_){}
+
+          doc.querySelectorAll('img').forEach(img=>{
+            let src=img.getAttribute('data-src')||img.getAttribute('data-lazy-src')||img.getAttribute('src')||'';
+            src=src.trim();
+            // Resolve relative URLs
+            if(!src.startsWith('http')){
+              if(src.startsWith('//'))src='https:'+src;
+                else if(src.startsWith('/'))src=pageOrigin+src;
+                else if(src&&pageBase)src=pageBase+src;
+            }
+            if(!src.startsWith('http')||seenImgUrls.has(src))return;
+            if(/(logo|icon|avatar|sprite|pixel|1x1|tracking|\.svg$|data:)/i.test(src))return;
+            // Filter tiny images by checking for dimension hints
+            const w=parseInt(img.getAttribute('width')||img.getAttribute('data-width')||'0');
+            const h=parseInt(img.getAttribute('height')||img.getAttribute('data-height')||'0');
+            if((w>0&&w<80)||(h>0&&h<80))return;
+            seenImgUrls.add(src);
+            const alt=(img.alt||img.title||'').trim().slice(0,100);
+            imgs.push({url:src,caption:alt});
+          });
+
+          // Feed into BM25 + CosSim
+          const sents=cleaned.match(/[^.!?\n]{20,}[.!?]+/g)||[];
+          sents.slice(0,60).forEach(s=>{
+            const c=s.trim()
+            .replace(/([a-z])([A-Z])/g,'$1 $2')
+            .replace(/\s+/g,' ').trim();
+            if(c.length>35){bm25.addDoc(c,`ADV:${lnk.text.slice(0,14)}`);markov.train(c);kg.learn(c,'ADV');}
+          });
+          updateStats();
+
+          advPages.push({
+            title:lnk.text||lnk.href.split('/').pop().replace(/[-_]/g,' '),
+                        url:lnk.href,text:cleaned,
+                        images:imgs.slice(0,8),
+                        refs:[],subtopics:[],colAutoMedia:[],isPreview:false,source:'Advanced'
+          });
+
+        }catch(_){/* proxy failed for this link — skip silently */}
+      }
+
+      advPhase.finishThinkStep(advStep,`Scraped ${advPages.length} pages · ${ytVideos.length} YouTube video${ytVideos.length===1?'':'s'} found`,'',false);
+      advPhase.finishWidget(false);
+
+      // Render YouTube gallery first (above articles)
+      if(ytVideos.length>0){
+        renderYTGallery(conv._body,ytVideos);
+      }
+
+      if(advPages.length>0){
+        const advHdr=document.createElement('div');advHdr.className='adv-section-hdr';
+        advHdr.innerHTML=`<svg viewBox="0 0 14 14" fill="none" stroke-width="1.5" stroke-linecap="round"><path d="M7 1v12M1 7h12"/></svg>Advanced — ${advPages.length} pages scraped from Google results`;
+        conv._body.appendChild(advHdr);
+        advPages.forEach((p,i)=>conv.addArticle(p,i,advPages.length,'Advanced'));
+      }
+
+      // Re-run BM25 with expanded corpus
+      const advRetrieved=bm25.query(q,10);
+      const advAnchor=advRetrieved.results.filter(r=>r.score>0)[0]?.d.text||q;
+      const advToks=advAnchor.split(/\s+/).filter(w=>w.length>3).slice(0,10);
+      const advMarkov=markov.gen(advAnchor,advToks,300,kg);
+      const advSynthImages=[...advPages.flatMap(p=>p.images||[]),...(ing.images||[])].filter(im=>im?.url).slice(0,20);
+      await conv.addPara('Here is an updated ranked summary — now includes content from all Google result pages.','muted',true);
+      await conv.addSummary(q,advRetrieved,ing.layer,advMarkov,ing.relatedTopics||[],advSynthImages);
+
+    } else {
+
+      // Prose before summary (normal mode)
+      await conv.addPara('Here is the ranked summary — the passages most relevant to your query at the top, with a synthesis at the end.','muted',true);
+
+      // FIX 3: Include standalone CSE images in synthImages even if rawPages was empty/null
+      const synthImages=[...(ing.images||[]),...(ing.rawPages||[]).flatMap(p=>p.images||[]),...(ing.rawPages?.length?[]:cseImages)].filter(im=>im&&im.url).slice(0,20);
+      await conv.addSummary(q,retrieved,ing.layer,markovGen,ing.relatedTopics||[],synthImages);
+
+    } // end normal mode
+
+    await conv.addPara(`All done. ${bm25.docs.length} passages indexed across ${bm25.vocabSz} vocabulary terms. Click any topic chip above to go deeper, or ask me a follow-up.`,'muted',true);
+    renderDebug({sysState:'Idle',layer:ing.layer,proj:retrieved.proj,qterms:retrieved.qterms,results:retrieved.results,trans:markovGen?.trans||[],corpus:`${bm25.docs.length} nodes · ${bm25.vocabSz} terms · ${markov.sentences.length} cos-sents · KG: ${kg.triples.length} triples ${kg.stats().concepts} concepts · strings: ${markovGen?.strings?.length||0} · bridges: ${markovGen?.bridges?.length||0}`,flog:ingester.log.slice(0,6).join('\n'),intent:_intent?.id||'info',searchStr:_searchStr||q});
+    setStatus('Ready');
+
+  }catch(e){
+    [pStep1,pStep2,pStep3,pStep4,pStep5,pStep6,pStep7,pStep8].forEach(s=>{try{proxyPhase.finishThinkStep(s,'✗ Failed','',true);}catch(_){}});
+    await conv.addPara(`Couldn't reach any external sources this time. I'll work from the ${bm25.docs.length} passages already in my corpus.`,'muted');
+    try{
+      const r=bm25.query(q,5);
+      const anchorText=r.results.filter(x=>x.score>0)[0]?.d.text||q;
+      const anchorToks=anchorText.split(/\s+/).filter(w=>w.length>3).slice(0,10);
+      const gen=markov.gen(anchorText,anchorToks,200,kg);
+      await conv.addSummary(q,r,'L3',gen,[],[]);
+    }catch(e2){await conv.addPara(`Something went wrong: ${e2.message}`,'muted');}
+    setStatus('Ready');
+  }
+  busy=false;$('send-btn').disabled=false;$('inp').focus();
+}
+
+// ── INPUT ──────────────────────────────────────────────────────────
+function autoResize(el){el.style.height='auto';el.style.height=Math.min(el.scrollHeight,120)+'px';}
+$('inp').addEventListener('input',()=>autoResize($('inp')));
+$('inp').addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey&&!e.isComposing){e.preventDefault();handleQuery($('inp').value.trim());}});
+$('send-btn').addEventListener('click',()=>handleQuery($('inp').value.trim()));
+
+// ── FILE UPLOAD ────────────────────────────────────────────────────
+function processText(text,name){
+  // Multi-pass sentence extraction
+  let sents=[];
+  // Pass 1: standard sentence boundary (. ! ?)
+  const p1=text.match(/[^.!?\n]{20,}[.!?]+/g)||[];
+  // Pass 2: semi-colon clauses (often independent enough)
+  const p2=text.split(/;\s+/).filter(l=>l.trim().length>35&&/[a-zA-Z]{3,}/.test(l));
+  // Pass 3: em-dash / colon separated clauses within a sentence
+  const p3=text.split(/[—–]\s*/).filter(l=>l.trim().length>35&&/[a-zA-Z]{3,}/.test(l));
+  // Pass 4: newline-separated paragraphs as fallback
+  const p4=text.split(/\n+/).map(l=>l.trim()).filter(l=>l.length>35);
+  // Combine all, deduplicate by normalised form
+  const seen=new Set();
+  [...p1,...p2,...p3,...(p1.length<5?p4:[])].forEach(s=>{
+    const clean=s.trim().replace(/\s+/g,' ').replace(/\[\d+\]/g,'');
+    // Skip headers, nav text, very short, all-caps
+    if(clean.length<30)return;
+    if(/^[A-Z\s\d]{8,}$/.test(clean))return;// all-caps line = header noise
+    if(/^(see also|references|external links|further reading|notes|bibliography|contents|navigation)/i.test(clean))return;
+    const key=clean.toLowerCase().slice(0,60);
+    if(!seen.has(key)){seen.add(key);sents.push(clean);}
+  });
+  // Deduplicate sentences that are substrings of other sentences
+  sents=sents.filter((s,i)=>!sents.some((other,j)=>j!==i&&other.length>s.length&&other.includes(s)));
+  let added=0;
+  sents.forEach(s=>{if(s.length>30&&bm25.addDoc(s,`📄${name.slice(0,14)}`)){markov.train(s);kg.learn(s,'file');added++;}});
+  return added;
+}
+$('file-inp').addEventListener('change',async e=>{
+  const files=Array.from(e.target.files||[]);if(!files.length)return;$('file-inp').value='';
+  for(const file of files){
+    const pill=document.createElement('div');pill.className='fpill';
+    pill.innerHTML=`<span>…</span><span>${esc(file.name.slice(0,20))}</span>`;$('fpills').appendChild(pill);
+    try{
+      const text=await file.text();const added=processText(text,file.name);updateStats();
+      pill.className='fpill ok';pill.innerHTML=`<span>✓</span><span>${esc(file.name.slice(0,16))}</span><span style="opacity:.5">[${added}]</span>`;
+      addMsg(`Uploaded: ${file.name}\n${added} sentence-nodes indexed\nCorpus: ${bm25.docs.length} nodes, ${bm25.vocabSz} terms`,'i','Ingest');
+    }catch(err){
+      pill.className='fpill';pill.style.borderColor='var(--red)';
+      pill.innerHTML=`<span style="color:var(--red)">✗</span><span>${esc(file.name.slice(0,16))}</span>`;
+      addMsg(`Upload error: ${err.message}`,'e');
+    }
+  }
+});
+
+// ── BOOT ───────────────────────────────────────────────────────────
+async function boot(){
+  const fill=$('boot-fill'),msg=$('boot-msg');
+  const steps=[[20,'Loading BM25 engine…',80],[40,'Building cosine similarity index…',100],[60,'Seeding knowledge corpus & concept graph…',180],[80,'Connecting fetch layers…',120],[100,'Ready.',200]];
+  for(const [pct,m,ms] of steps){
+    await new Promise(r=>setTimeout(r,ms));
+    fill.style.width=pct+'%';msg.textContent=m;
+  }
+  const sents=[];
+  const seen2=new Set();
+  // Multi-pass: standard sentences + semicolons + em-dash clauses
+  [...(SEED.match(/[^.!?\n]+[.!?]+/g)||[]),...SEED.split(/;\s+/).filter(l=>l.length>35)].forEach(s=>{
+    const clean=s.trim().replace(/\s+/g,' ');
+    const key=clean.toLowerCase().slice(0,60);
+    if(clean.length>30&&!seen2.has(key)){seen2.add(key);sents.push(clean);}
+  });
+  sents.forEach(s=>{bm25.addDoc(s.trim(),'seed');markov.train(s);kg.learn(s,'seed');});
+  // Bootstrap Knowledge Graph with English concept relationships
+  kg.learn(KG_SEED,'kg-boot');
+  updateStats();
+  await new Promise(r=>setTimeout(r,200));
+  const bo=$('boot');bo.style.transition='opacity .3s';bo.style.opacity='0';
+  setTimeout(()=>bo.remove(),300);
+  renderDebug({sysState:'Idle',layer:'L3',proj:new Array(128).fill(0),qterms:[],results:[],trans:[],corpus:`${bm25.docs.length} nodes · ${bm25.vocabSz} terms · KG: ${kg.triples.length} triples`,flog:'System initialized.'});
+  dot('d-bm25','on');dot('d-mkv','on');dot('d-l3','on');
+  const hour=new Date().getHours();
+  const greeting=hour<12?'Happy morning':hour<18?'Afternoon Dear':'Evening thoughts';
+  $('hero-greeting').textContent=greeting+'!';
+  $('inp').focus();
+}
+boot();
