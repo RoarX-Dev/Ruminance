@@ -22,5 +22,21 @@ A zero-setup Research engine  (RAG from multiple sources + local NLP in pure js)
 * Observable Intelligence:  Every step it takes, from the way it searches - to the path it takes, is all visible and can be traced back to the source.
 * Client-Side Locality: It requires no API keys or setups, no servers and hence no node.js or docker at all.It's cool and tiny try it out.
 
+  #BASIC GUIDE:-
+  **IN-CHAT COMMANDS**:
+  */help:  To get a list of available commands
+  */image [query]: To search for images only
+  */search [query]: Force AI retrival from local database only
+  */theme [dark|neon|light]: To change themes
+  */clear: To clear the chat-interface
+  */reset: To perform a hard reset wiping all the locally saved data
+  */debug: Toggles debug pannel
+  */stats:  View current corpus statistic
+  */upload:  To upload your own data as a knowledge database
+  **OTHER**
+  *In Chat-Input *Advance* toggle fetches more data
+  **Thesaurus* button on top-right allows uploading a thesaurus dictionary also available in repo which AI can use for enhanced Vocab
+  * SAVE BRAIN/LOAD BRAIN helps one save the current session(as a json) locally and continue anytime
+  * *TO START OF JUST TYPE A QUERY IN CHAT BOX,AND SEE IT PULL DATA AND PRESENT TO YOU RAW( AND ALSO IN ITS OWN WORDS WHICH ARE JUST NOT SO STABLE YET)*
   # Notice:-
   >If you find it interesting please star it and if you wish to use it (or any parts of it) you may do so freely and may aswell mention me if you would like to! :D
