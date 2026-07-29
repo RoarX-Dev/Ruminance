@@ -1,5 +1,5 @@
 # Ruminance
-A zero-setup Research engine  (RAG from multiple sources + local NLP in pure js),included with A local Deterministic AI synthesis using BM25, Cosine simmilarity etc. Its Experimental and not serious, *ITS MORE OF AN EXPERIMENT*!
+A zero-setup Research engine  (RAG from multiple sources + local NLP in pure js),included with A local Deterministic AI synthesis using BM25, Cosine simmilarity etc. Its Experimental and not serious, *ITS NOT IN FOCUS ANYMORE*!
 
 # Demo
 >*See the Demo* : <https://roarx-dev.github.io/Ruminance/>
