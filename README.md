@@ -34,6 +34,7 @@ A zero-setup Research engine  (RAG from multiple sources + local NLP in pure js)
   * /stats:  View current corpus statistic
   * /upload:  To upload your own data as a knowledge database
 ## **OTHER**
+  * The RAG uses Cloudflare worker backend for scrape.For anyone wanting to use beyond just some expreiment is advised tomake their own worker back end.(*which is absolutely free*)
   * In Chat-Input *Advance* toggle fetches more data
   * *Thesaurus* button on top-right allows uploading a thesaurus dictionary also available in repo which AI can use for enhanced Vocab
   * SAVE BRAIN/LOAD BRAIN helps one save the current session(as a json) locally and continue anytime
