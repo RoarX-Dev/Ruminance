@@ -96,7 +96,7 @@ body{background:var(--bg);color:var(--text);font-family:'Inter',sans-serif;font-
 .act-step-time{font-size:10px;color:var(--text3);opacity:.35;white-space:nowrap;flex-shrink:0;padding-top:2px;margin-left:auto;}
 @keyframes awpulse{from{opacity:.3}to{opacity:1}}
 
-/* Status lines */
+/* Status lines (kept slim below phases) */
 .status-line{display:flex;align-items:center;gap:8px;padding:5px 0 5px 2px;font-size:12.5px;color:var(--text3);line-height:1.4;}
 .status-line .sl-dot{width:6px;height:6px;border-radius:50%;background:var(--border2);flex-shrink:0;transition:background .2s,box-shadow .2s;}
 .status-line.live .sl-dot{background:var(--orange);box-shadow:0 0 6px rgba(217,119,6,.7);animation:spulse .8s ease infinite alternate;}
@@ -117,6 +117,7 @@ body{background:var(--bg);color:var(--text);font-family:'Inter',sans-serif;font-
 .art-prose{margin:16px 0 8px;}
 .art-prose-title{font-size:15px;font-weight:700;color:var(--text);margin-bottom:2px;}
 .art-prose-source{font-size:11px;color:var(--orange);margin-bottom:10px;opacity:.8;}
+/* Article body renders as flowing paragraphs with inline images */
 .art-prose-content{font-size:13.5px;line-height:1.82;color:var(--text2);word-break:break-word;}
 .art-prose-content p{margin-bottom:14px;}
 .art-prose-content p:last-child{margin-bottom:0;}
@@ -136,7 +137,7 @@ body{background:var(--bg);color:var(--text);font-family:'Inter',sans-serif;font-
 .subtopic-chip:hover{border-color:var(--orange);color:var(--text);background:var(--orange2);}
 .subtopic-chip .chip-icon{font-size:10px;opacity:.6;}
 
-/* Media (images/videos in col-auto) */
+/* Media chips (images/videos in col-auto) */
 .media-strip{display:flex;gap:7px;flex-wrap:wrap;margin-bottom:10px;}
 .media-thumb{width:60px;height:44px;border-radius:5px;overflow:hidden;border:1px solid var(--border);background:var(--bg3);cursor:pointer;position:relative;flex-shrink:0;}
 .media-thumb img{width:100%;height:100%;object-fit:cover;display:block;}
@@ -182,7 +183,7 @@ body{background:var(--bg);color:var(--text);font-family:'Inter',sans-serif;font-
 .brit-preview-title{font-size:13px;font-weight:600;color:var(--text);margin-bottom:2px;}
 .brit-preview-snippet{font-size:11.5px;color:var(--text3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
 .brit-preview-cta{font-size:10px;color:var(--orange);font-weight:600;flex-shrink:0;}
-/* Markov synthesis */
+/* Enhanced Markov synthesis */
 .synth-block{margin-top:18px;border:1px solid var(--border2);border-radius:10px;overflow:hidden;background:var(--bg2);}
 .synth-hdr{padding:10px 14px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:8px;}
 .synth-hdr-icon{width:22px;height:22px;border-radius:5px;background:var(--orange2);border:1px solid rgba(217,119,6,.3);display:flex;align-items:center;justify-content:center;font-size:11px;}
@@ -197,7 +198,7 @@ body{background:var(--bg);color:var(--text);font-family:'Inter',sans-serif;font-
 .synth-text{font-size:14px;line-height:1.85;color:var(--text2);}
 .synth-text-para{margin-bottom:12px;}
 .synth-text-para:last-child{margin-bottom:0;}
-/* TYPE EFFECT */
+/* Typewriter word-by-word */
 .typing-word{opacity:0;animation:wfade .08s ease forwards;}
 @keyframes wfade{from{opacity:0;transform:translateY(1px)}to{opacity:1;transform:none}}
 
@@ -402,10 +403,15 @@ body{background:var(--bg);color:var(--text);font-family:'Inter',sans-serif;font-
 <!-- BOOT -->
 <div id="boot">
   <svg id="boot-logo" width="56" height="56" viewBox="0 0 56 56" fill="none" xmlns="http://www.w3.org/2000/svg" style="margin-bottom:4px">
+    <!-- Outer ambient ring -->
     <circle cx="28" cy="28" r="26" fill="rgba(217,119,6,0.07)" />
+    <!-- Neural arc background -->
     <circle cx="28" cy="28" r="20" fill="rgba(217,119,6,0.1)" stroke="rgba(217,119,6,0.25)" stroke-width="1"/>
+    <!-- Geometric brain lobes -->
     <path d="M20 18 Q18 14 22 12 Q26 10 28 13 Q30 10 34 12 Q38 14 36 18 L36 26 Q36 32 30 34 L28 35 L26 34 Q20 32 20 26 Z" fill="rgba(217,119,6,0.15)" stroke="#d97706" stroke-width="1.4" stroke-linejoin="round"/>
+    <!-- Brain center divide line -->
     <line x1="28" y1="13" x2="28" y2="34" stroke="#d97706" stroke-width="0.8" stroke-dasharray="2 1.5" opacity="0.5"/>
+    <!-- Neural nodes -->
     <circle cx="23" cy="21" r="2" fill="#d97706" opacity="0.7"/>
     <circle cx="33" cy="21" r="2" fill="#d97706" opacity="0.7"/>
     <circle cx="21" cy="27" r="1.5" fill="#d97706" opacity="0.55"/>
@@ -418,12 +424,12 @@ body{background:var(--bg);color:var(--text);font-family:'Inter',sans-serif;font-
     <line x1="35" y1="27" x2="28" y2="30" stroke="#d97706" stroke-width="0.8" opacity="0.3"/>
     <!-- Stem / thought anchor -->
     <path d="M28 35 L28 42 Q28 44 32 44" stroke="#d97706" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
-    <!-- Outer circle dots -->
+    <!-- Outer orbit dots -->
     <circle cx="28" cy="2" r="2" fill="#d97706" opacity="0.6"/>
     <circle cx="54" cy="28" r="2" fill="#d97706" opacity="0.6"/>
     <circle cx="28" cy="54" r="2" fill="#d97706" opacity="0.4"/>
     <circle cx="2" cy="28" r="2" fill="#d97706" opacity="0.4"/>
-    <!-- Dashed circle -->
+    <!-- Dashed orbit -->
     <circle cx="28" cy="28" r="26" stroke="#d97706" stroke-width="0.7" stroke-dasharray="3 5" opacity="0.3"/>
   </svg>
   <div id="boot-name"><arbitary style="font-size:40px;">R</arbitary>UMINANCE</div>
@@ -434,7 +440,9 @@ body{background:var(--bg);color:var(--text);font-family:'Inter',sans-serif;font-
 <div id="hdr">
   <div id="hdr-logo">
     <svg id="hdr-logo-icon" viewBox="0 0 28 28" fill="none" xmlns="http://www.w3.org/2000/svg">
+      <!-- Background glow -->
       <circle cx="14" cy="14" r="13" fill="rgba(217,119,6,0.09)"/>
+      <!-- Brain shape -->
       <path d="M10 9 Q9 7 11 6 Q13 5 14 6.5 Q15 5 17 6 Q19 7 18 9 L18 13 Q18 16 15 17 L14 17.5 L13 17 Q10 16 10 13 Z" fill="rgba(217,119,6,0.12)" stroke="#d97706" stroke-width="1.1" stroke-linejoin="round"/>
       <line x1="14" y1="6.5" x2="14" y2="17" stroke="#d97706" stroke-width="0.6" stroke-dasharray="1.5 1.2" opacity="0.45"/>
       <!-- Neural nodes -->
@@ -446,7 +454,7 @@ body{background:var(--bg);color:var(--text);font-family:'Inter',sans-serif;font-
       <line x1="16.5" y1="10.5" x2="14" y2="15" stroke="#d97706" stroke-width="0.7" opacity="0.3"/>
       <!-- Stem -->
       <path d="M14 17.5 L14 21 Q14 22 16 22" stroke="#d97706" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
-      <!-- Circle  -->
+      <!-- Orbit -->
       <circle cx="14" cy="14" r="13" stroke="#d97706" stroke-width="0.5" stroke-dasharray="2 3.5" opacity="0.3"/>
       <circle cx="14" cy="1" r="1" fill="#d97706" opacity="0.65"/>
       <circle cx="27" cy="14" r="1" fill="#d97706" opacity="0.65"/>
@@ -477,7 +485,7 @@ body{background:var(--bg);color:var(--text);font-family:'Inter',sans-serif;font-
   <div id="chat">
     <div id="msgs">
       <div id="hero">
-        <!-- RUMI - the charismatic circle -->
+        <!-- RUMI — the animated character -->
         <div id="rumi-wrap">
           <div id="rumi-glow"></div>
           <div id="rumi-bubble"><span class="think-dots"><span></span><span></span><span></span></span></div>
@@ -488,18 +496,18 @@ body{background:var(--bg);color:var(--text);font-family:'Inter',sans-serif;font-
             <circle cx="50" cy="50" r="36" fill="#2a2218"/>
             <!-- Inner face area -->
             <circle cx="50" cy="50" r="30" fill="#332a1a"/>
-            <!-- Neural-brain texture stripes -->
+            <!-- Neural-brain texture stripes (subtle) -->
             <path d="M30 35 Q40 30 50 34 Q60 30 70 35" stroke="rgba(217,119,6,0.12)" stroke-width="1.5" fill="none"/>
             <path d="M28 42 Q38 37 50 41 Q62 37 72 42" stroke="rgba(217,119,6,0.1)" stroke-width="1.2" fill="none"/>
             <!-- Outer ring subtle glow -->
             <circle cx="50" cy="50" r="36" stroke="rgba(217,119,6,0.35)" stroke-width="1.5"/>
-            <!-- Ear bumps (antenna) -->
+            <!-- Ear bumps (antenna / neural bumps) -->
             <circle cx="16" cy="46" r="6" fill="#2a2218" stroke="rgba(217,119,6,0.3)" stroke-width="1"/>
             <circle cx="84" cy="46" r="6" fill="#2a2218" stroke="rgba(217,119,6,0.3)" stroke-width="1"/>
             <circle cx="16" cy="46" r="2.5" fill="rgba(217,119,6,0.4)"/>
             <circle cx="84" cy="46" r="2.5" fill="rgba(217,119,6,0.4)"/>
 
-            <!-- EYEBROWS -->
+            <!-- EYEBROWS (move with looking) -->
             <g id="rumi-brow-l">
               <path d="M33 36 Q38 33 43 35" stroke="#d97706" stroke-width="2" stroke-linecap="round" fill="none"/>
             </g>
@@ -519,7 +527,7 @@ body{background:var(--bg);color:var(--text);font-family:'Inter',sans-serif;font-
               <!-- Eyelid (for blinking via scaleY on parent group) -->
             </g>
 
-            <!-- (RIGHT) SIDE EYE -->
+            <!-- RIGHT EYE -->
             <g id="rumi-eye-container-r" class="rumi-eye-r">
               <circle cx="62" cy="46" r="8.5" fill="#1a1208"/>
               <circle cx="62" cy="46" r="7" fill="#0d0a05"/>
@@ -759,7 +767,7 @@ async function loadThesaurus(input){
 }
 
 // ══════════════════════════════════════════════════════════════════
-//  Poorly made NLP ENGINE
+//  NLP ENGINE
 // ──────────────────────────────────────────────────────────────────
 // 1. SynonymLexicon   — 700+ synonym clusters, query expansion
 // 2. PhraseDetector   — bigram/trigram compound recognition
@@ -776,6 +784,7 @@ const SynonymLexicon=(function(){
   //         philosophy, arts, sports, politics, everyday language
   const RAW={
     // Core vocabulary(Made AI do this labour)
+    // requires handle for different forms - ing,ed,s,es
     'begin':['start','commence','initiate','launch','originate','found','create','establish'],
     'end':['finish','conclude','terminate','cease','stop','abolish','dissolve','complete'],
     'make':['create','produce','manufacture','build','construct','form','generate','develop'],
@@ -976,10 +985,10 @@ const PhraseDetector=(function(){
     'world war','cold war','civil war','french revolution','industrial revolution',
     'american revolution','russian revolution','british empire','roman empire',
     'ottoman empire','mongol empire','east india company','silk road',
-    'united nations','european union','world trade organization',
+    'united nations','european union','world trade organization','british raj',
     'great depression','stock market','human rights','civil rights',
     'second world war','first world war','middle ages','ancient rome','ancient egypt',
-    'ancient greece','feudal system','magna carta','french revolution',
+    'ancient greece','feudal system','magna carta','french revolution','multipolar world',
     // Geography
     'united states','united kingdom','south africa','latin america','middle east',
     'south asia','southeast asia','central america','north america',
@@ -1996,7 +2005,7 @@ class POSTagger{
     this.PRON =new Set('i me we us you he him she her they them it who whom ones one'.split(' '));
     this.MOD  =new Set('can could will would shall should may might must need dare ought'.split(' '));
     this.AUX  =new Set('is are was were be been being have has had do does did'.split(' '));
-    this.NEG  =new Set(['not',"n't",'never','no']);
+    this.NEG  =new Set(['not',"n't",'never','no','nope','neither','negative']);
     this.ADV  =new Set('also very quite rather just only even still already now here there always often never sometimes usually generally largely mainly mostly partly perhaps probably certainly clearly especially particularly'.split(' '));
     this.NUM  =/^\d[\d,\.]*(%|st|nd|rd|th)?$|^(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|hundred|thousand|million|billion|first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)$/i;
     // Verb past-tense/past-participle irregular endings
@@ -4000,12 +4009,9 @@ class KnowledgeGraph{
 (()=>{
   const e=encodeURIComponent;
   const PROXIES=[
-    {name:'codetabs',fn:async(url,ms)=>{const r=await Promise.race([fetch(`https://api.codetabs.com/v1/proxy?quest=${e(url)}`),new Promise((_,rj)=>setTimeout(()=>rj(new Error('timeout')),ms))]);if(!r.ok)throw new Error(`codetabs ${r.status}`);const t=await r.text();if(t.length<200)throw new Error('too short');return t;}},
-    {name:'cors.lol',fn:async(url,ms)=>{const r=await Promise.race([fetch(`https://api.cors.lol/?url=${e(url)}`),new Promise((_,rj)=>setTimeout(()=>rj(new Error('timeout')),ms))]);if(!r.ok)throw new Error(`cors.lol ${r.status}`);const t=await r.text();if(t.length<200)throw new Error('too short');return t;}},
-    {name:'allorigins',fn:async(url,ms)=>{const r=await Promise.race([fetch(`https://api.codetabs.com/v1/proxy?quest=${e(url)}`),new Promise((_,rj)=>setTimeout(()=>rj(new Error('timeout')),ms))]);if(!r.ok)throw new Error(`allorigins ${r.status}`);const j=await r.json();if(!j.contents||j.contents.length<200)throw new Error('empty');return j.contents;}},
-    {name:'corsproxy.io',fn:async(url,ms)=>{const r=await Promise.race([fetch(`https://api.codetabs.com/v1/proxy?quest=${e(url)}`),new Promise((_,rj)=>setTimeout(()=>rj(new Error('timeout')),ms))]);if(!r.ok)throw new Error(`corsproxy.io ${r.status}`);const t=await r.text();if(t.length<200)throw new Error('too short');return t;}},
+    {name:'RED-MOON',fn:async(url,ms)=>{const r=await Promise.race([fetch(`https://red-moon-848d.roarxcorp.workers.dev/?url=${e(url)}`),new Promise((_,rj)=>setTimeout(()=>rj(new Error('timeout')),ms))]);if(!r.ok)throw new Error(`RED-MOON ${r.status}`);const t=await r.text();if(t.length<200)throw new Error('too short');return t;}}
   ];
-  window.__proxyBridge={fetch:async(url,ms=14000)=>{const log=[];for(const px of PROXIES){try{return await px.fn(url,ms);}catch(err){log.push(`${px.name}: ${err.message}`);}}throw new Error(`All proxies failed — ${log.join(' | ')}`);}}
+  window.__proxyBridge={fetch:async(url,ms=14000)=>{const log=[];for(const px of PROXIES){try{return await px.fn(url,ms);}catch(err){log.push(`${px.name}: ${err.message}`);}}throw new Error(`TUNNEL FAILED— ${log.join(' | ')}`);}}
 })();
 
 // ── INGESTER ───────────────────────────────────────────────────────
